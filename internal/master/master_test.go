@@ -46,6 +46,13 @@ func TestDeployRejectsMissingSha(t *testing.T) {
 	}
 }
 
+func TestDeployRejectsNonHexShaBeforeAccept(t *testing.T) {
+	recorder := request(newTestMaster(t), true, `{"service":"llm","commit_sha":"abc; rm -rf /"}`)
+	if recorder.Code != 422 || !strings.Contains(recorder.Body.String(), "invalid_sha") {
+		t.Fatalf("비hex sha가 202로 접수됨: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestDeployAcceptsKnownService(t *testing.T) {
 	recorder := request(newTestMaster(t), true, `{"service":"llm","commit_sha":"abc1234def"}`)
 	if recorder.Code != 202 || !strings.Contains(recorder.Body.String(), `"success":true`) {

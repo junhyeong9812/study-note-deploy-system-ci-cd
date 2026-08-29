@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/junhyeong9812/study-note-deploy-system-ci-cd/internal/agent"
 	"github.com/junhyeong9812/study-note-deploy-system-ci-cd/internal/master"
@@ -36,7 +37,15 @@ func main() {
 		port = defaultPort
 	}
 	logger.Log("boot", "listening :"+port+" mode="+mode, "info")
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	server := &http.Server{                       // 자원 보호 타임아웃 (리뷰 F9)
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    8 << 10,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
