@@ -95,19 +95,29 @@ func (agent *Agent) handleDeploy(writer http.ResponseWriter, request *http.Reque
 }
 
 // composeDeploy — allowlist 디렉토리에서만, 고정 인자만. TAG는 compose가 ${TAG}로 소비.
-// composeService가 있으면 그 서비스만 pull/up — 무관 이미지 갱신·재생성 차단.
+// 순서: ① git 동기화(디렉토리가 clone이면 — compose·설정 변경 전달, .env는 미추적이라 보존)
+//       ② 대상 서비스만 pull ③ 대상 서비스만 up (무관 이미지 갱신·재생성 차단)
+// (실측 2026-08-29: 이미지만 배포하면 compose 변경이 호스트에 영원히 안 닿는다)
 func (agent *Agent) composeDeploy(directory, imageTag, composeService string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
-	pullArguments := []string{"compose", "pull"}
-	upArguments := []string{"compose", "up", "-d"}
+	commands := [][]string{}
+	if _, err := os.Stat(directory + "/.git"); err == nil {
+		commands = append(commands,
+			[]string{"git", "-C", directory, "fetch", "--depth=1", "origin", "main"},
+			[]string{"git", "-C", directory, "reset", "--hard", "origin/main"},
+		)
+	}
+	pullArguments := []string{"docker", "compose", "pull"}
+	upArguments := []string{"docker", "compose", "up", "-d"}
 	if composeService != "" {
 		pullArguments = append(pullArguments, composeService)
 		upArguments = append(upArguments, composeService)
 	}
+	commands = append(commands, pullArguments, upArguments)
 	var combined strings.Builder
-	for _, arguments := range [][]string{pullArguments, upArguments} {
-		command := exec.CommandContext(ctx, "docker", arguments...)
+	for _, arguments := range commands {
+		command := exec.CommandContext(ctx, arguments[0], arguments[1:]...)
 		command.Dir = directory
 		command.Env = append(os.Environ(), "TAG="+imageTag)
 		output, err := command.CombinedOutput()
