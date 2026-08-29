@@ -17,13 +17,13 @@ import (
 
 type DeployRequest struct {
 	Service   string `json:"service"`
-	ImageTag  string `json:"image_tag"`
+	CommitSha string `json:"commit_sha"`
 	RequestID string `json:"request_id"`
 }
 
 type deployRecord struct {
 	Service   string `json:"service"`
-	ImageTag  string `json:"image_tag"`
+	CommitSha string `json:"commit_sha"`
 	RequestID string `json:"request_id"`
 	Outcome   string `json:"outcome"`
 	Detail    string `json:"detail,omitempty"`
@@ -66,8 +66,8 @@ func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	var deploy DeployRequest
-	if err := json.Unmarshal(body, &deploy); err != nil || deploy.Service == "" || deploy.ImageTag == "" {
-		shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_request", "need service·image_tag")
+	if err := json.Unmarshal(body, &deploy); err != nil || deploy.Service == "" || deploy.CommitSha == "" {
+		shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_request", "need service·commit_sha")
 		return
 	}
 	requestID := shared.AcceptOrIssue(deploy.RequestID)
@@ -77,7 +77,7 @@ func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Req
 		shared.WriteFail(writer, http.StatusUnprocessableEntity, "unknown_service", deploy.Service)
 		return
 	}
-	master.logger.Log(requestID, fmt.Sprintf("deploy accepted %s tag=%s", deploy.Service, deploy.ImageTag), "info")
+	master.logger.Log(requestID, fmt.Sprintf("deploy accepted %s sha=%s", deploy.Service, deploy.CommitSha), "info")
 
 	go master.dispatch(requestID, deploy, agentURL) // 접수 즉시 202 — Actions를 기다리게 하지 않는다
 	shared.WriteAccepted(writer, map[string]any{"request_id": requestID, "service": deploy.Service})
@@ -86,7 +86,7 @@ func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Req
 func (master *Master) dispatch(requestID string, deploy DeployRequest, agentURL string) {
 	startedAt := time.Now()
 	payload, _ := json.Marshal(map[string]string{
-		"service": deploy.Service, "image_tag": deploy.ImageTag, "request_id": requestID,
+		"service": deploy.Service, "commit_sha": deploy.CommitSha, "request_id": requestID,
 	})
 	client := &http.Client{Timeout: 5 * time.Minute} // pull에 수 분 걸릴 수 있다
 	agentRequest, _ := http.NewRequest(http.MethodPost, agentURL+"/agent/deploy", bytes.NewReader(payload))
@@ -111,12 +111,12 @@ func (master *Master) dispatch(requestID string, deploy DeployRequest, agentURL 
 		level = "error"
 	}
 	master.logger.Log(requestID,
-		fmt.Sprintf("deploy %s %s tag=%s %dms %s", outcome, deploy.Service, deploy.ImageTag, tookMs, truncate(detail, 200)), level)
+		fmt.Sprintf("deploy %s %s sha=%s %dms %s", outcome, deploy.Service, deploy.CommitSha, tookMs, truncate(detail, 200)), level)
 
 	master.mutex.Lock()
 	defer master.mutex.Unlock()
 	master.history = append(master.history, deployRecord{
-		Service: deploy.Service, ImageTag: deploy.ImageTag, RequestID: requestID,
+		Service: deploy.Service, CommitSha: deploy.CommitSha, RequestID: requestID,
 		Outcome: outcome, Detail: truncate(detail, 300),
 		At: startedAt.UTC().Format(time.RFC3339), TookMs: tookMs,
 	})

@@ -26,15 +26,15 @@ func request(agent *Agent, body string) *httptest.ResponseRecorder {
 }
 
 func TestAgentRejectsUnknownService(t *testing.T) {
-	recorder := request(newTestAgent(t), `{"service":"other","image_tag":"abc"}`)
+	recorder := request(newTestAgent(t), `{"service":"other","commit_sha":"abc1234"}`)
 	if recorder.Code != 422 {
 		t.Fatalf("디렉토리 allowlist 밖 서비스 통과: %d", recorder.Code)
 	}
 }
 
-func TestAgentRejectsShellInjectionTag(t *testing.T) {
-	recorder := request(newTestAgent(t), `{"service":"llm","image_tag":"abc; rm -rf /"}`)
-	if recorder.Code != 422 || !strings.Contains(recorder.Body.String(), "invalid_tag") {
-		t.Fatalf("주입성 태그 통과: %d %s", recorder.Code, recorder.Body.String())
+func TestAgentRejectsNonHexSha(t *testing.T) {
+	recorder := request(newTestAgent(t), `{"service":"llm","commit_sha":"abc; rm -rf /"}`)
+	if recorder.Code != 422 || !strings.Contains(recorder.Body.String(), "invalid_sha") {
+		t.Fatalf("비hex sha 통과: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
