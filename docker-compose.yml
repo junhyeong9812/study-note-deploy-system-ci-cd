@@ -1,18 +1,33 @@
-# MODE=master → .9:15000 (배포 접수·라우팅) / MODE=agent → 각 호스트 :15001 (compose 실행)
-# .env: MODE·DEPLOY_SECRET·LOG_REDIS_URL·(master) AGENT_URL_*·(agent) DEPLOY_DIR_*
+# 역할별 서비스 분리(리뷰 F4) — master는 docker.sock·저장소 마운트 없음(접수·라우팅만).
+# .9:      docker compose --profile master --profile agent up -d --build
+# 그 외:   docker compose --profile agent up -d --build
 services:
-  ci-cd:
+  master:
     build: .
-    container_name: ci-cd-${MODE:?set-in-env}
-    network_mode: host          # master→agent LAN 호출·agent의 로컬 compose 제어 단순화
-    env_file: ${ENV_FILE:-.env}
+    profiles: ["master"]
+    container_name: ci-cd-master
+    network_mode: host
+    env_file: .env.master
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:15000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  agent:
+    build: .
+    profiles: ["agent"]
+    container_name: ci-cd-agent
+    network_mode: host
+    env_file: .env.agent
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock     # agent: 호스트 docker 제어
+      - /var/run/docker.sock:/var/run/docker.sock     # agent만 — 호스트 docker 제어
       - ${HOME}/study-note-deploy-system-front:${HOME}/study-note-deploy-system-front
       - ${HOME}/study-note-deploy-system-backend:${HOME}/study-note-deploy-system-backend
       - ${HOME}/study-note-deploy-system-llm:${HOME}/study-note-deploy-system-llm
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:${PORT:-15001}/health"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:15001/health"]
       interval: 30s
       timeout: 5s
       retries: 3

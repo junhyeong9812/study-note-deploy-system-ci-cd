@@ -35,8 +35,9 @@ type Master struct {
 	secret  string
 	logger  *shared.Logger
 	agents  map[string]string // service → agent base URL (env — repo에 IP 금지)
-	mutex   sync.Mutex
-	history []deployRecord // 최근 배포 이력 (메모리 — 롤백 참고용 태그 기록)
+	mutex    sync.Mutex
+	history  []deployRecord // 최근 배포 이력 (메모리 — 롤백 참고용 sha 기록)
+	inFlight map[string]bool // 서비스별 single-flight (리뷰 F6 — agent 409로의 무음 유실 방지)
 }
 
 func New(logger *shared.Logger) *Master {
@@ -47,7 +48,8 @@ func New(logger *shared.Logger) *Master {
 			agents[service] = agentURL
 		}
 	}
-	return &Master{secret: os.Getenv("DEPLOY_SECRET"), logger: logger, agents: agents}
+	return &Master{secret: os.Getenv("DEPLOY_SECRET"), logger: logger, agents: agents,
+		inFlight: map[string]bool{}}
 }
 
 func (master *Master) Register(mux *http.ServeMux) {
@@ -71,12 +73,25 @@ func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	requestID := shared.AcceptOrIssue(deploy.RequestID)
+	if !shared.ValidCommitSha(deploy.CommitSha) {          // 접수 전에 거절 — 로그 주입·비정상 202 차단 (F5)
+		shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_sha", "")
+		return
+	}
 	agentURL, allowed := master.agents[deploy.Service]
 	if !allowed {
 		master.logger.Log(requestID, fmt.Sprintf("deploy rejected: unknown service %q", deploy.Service), "warning")
 		shared.WriteFail(writer, http.StatusUnprocessableEntity, "unknown_service", deploy.Service)
 		return
 	}
+	master.mutex.Lock()
+	if master.inFlight[deploy.Service] {                    // 진행 중이면 명시적 409 — 무음 유실 금지 (F6)
+		master.mutex.Unlock()
+		master.logger.Log(requestID, "deploy rejected: in progress "+deploy.Service, "warning")
+		shared.WriteFail(writer, http.StatusConflict, "deploy_in_progress", deploy.Service)
+		return
+	}
+	master.inFlight[deploy.Service] = true
+	master.mutex.Unlock()
 	master.logger.Log(requestID, fmt.Sprintf("deploy accepted %s sha=%s", deploy.Service, deploy.CommitSha), "info")
 
 	go master.dispatch(requestID, deploy, agentURL) // 접수 즉시 202 — Actions를 기다리게 하지 않는다
@@ -84,11 +99,16 @@ func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Req
 }
 
 func (master *Master) dispatch(requestID string, deploy DeployRequest, agentURL string) {
+	defer func() {
+		master.mutex.Lock()
+		delete(master.inFlight, deploy.Service)
+		master.mutex.Unlock()
+	}()
 	startedAt := time.Now()
 	payload, _ := json.Marshal(map[string]string{
 		"service": deploy.Service, "commit_sha": deploy.CommitSha, "request_id": requestID,
 	})
-	client := &http.Client{Timeout: 5 * time.Minute} // pull에 수 분 걸릴 수 있다
+	client := &http.Client{Timeout: 12 * time.Minute} // 호스트 빌드(gradle 등) 여유 — agent 내부 10분 + 마진
 	agentRequest, _ := http.NewRequest(http.MethodPost, agentURL+"/agent/deploy", bytes.NewReader(payload))
 	agentRequest.Header.Set("Content-Type", "application/json")
 	agentRequest.Header.Set(shared.SecretHeader, master.secret)
