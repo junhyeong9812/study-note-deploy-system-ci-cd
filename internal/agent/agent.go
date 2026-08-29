@@ -28,7 +28,7 @@ type Agent struct {
 	busy        sync.Mutex // 한 번에 하나의 배포만 (호스트 자원 보호)
 }
 
-var validTag = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`) // 셸 주입 차단
+var validSha = regexp.MustCompile(`^[0-9a-f]{7,64}$`) // 커밋 해시만 — 셸 주입·임의 ref 차단
 
 func New(logger *shared.Logger) *Agent {
 	directories := map[string]string{}
@@ -57,7 +57,7 @@ func (agent *Agent) handleDeploy(writer http.ResponseWriter, request *http.Reque
 	body, _ := io.ReadAll(io.LimitReader(request.Body, 4096))
 	var payload struct {
 		Service   string `json:"service"`
-		ImageTag  string `json:"image_tag"`
+		CommitSha string `json:"commit_sha"`
 		RequestID string `json:"request_id"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -70,8 +70,8 @@ func (agent *Agent) handleDeploy(writer http.ResponseWriter, request *http.Reque
 		shared.WriteFail(writer, http.StatusUnprocessableEntity, "unknown_service", payload.Service)
 		return
 	}
-	if !validTag.MatchString(payload.ImageTag) {
-		shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_tag", "")
+	if !validSha.MatchString(payload.CommitSha) {
+		shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_sha", "")
 		return
 	}
 	if !agent.busy.TryLock() {
@@ -81,45 +81,38 @@ func (agent *Agent) handleDeploy(writer http.ResponseWriter, request *http.Reque
 	defer agent.busy.Unlock()
 
 	startedAt := time.Now()
-	agent.logger.Log(requestID, fmt.Sprintf("agent deploy start %s tag=%s", payload.Service, payload.ImageTag), "info")
+	agent.logger.Log(requestID, fmt.Sprintf("agent deploy start %s sha=%s", payload.Service, payload.CommitSha), "info")
 	composeService := agent.composeServices[payload.Service] // ""이면 전체 (비권장 — env로 지정)
-	output, err := agent.composeDeploy(directory, payload.ImageTag, composeService)
+	output, err := agent.composeDeploy(directory, payload.CommitSha, composeService)
 	tookMs := time.Since(startedAt).Milliseconds()
 	if err != nil {
 		agent.logger.Log(requestID, fmt.Sprintf("agent deploy failed %s: %s", payload.Service, truncate(output, 200)), "error")
 		shared.WriteFail(writer, http.StatusInternalServerError, "deploy_failed", truncate(output, 500))
 		return
 	}
-	agent.logger.Log(requestID, fmt.Sprintf("agent deploy ok %s tag=%s %dms", payload.Service, payload.ImageTag, tookMs), "info")
+	agent.logger.Log(requestID, fmt.Sprintf("agent deploy ok %s sha=%s %dms", payload.Service, payload.CommitSha, tookMs), "info")
 	shared.WriteOK(writer, map[string]any{"took_ms": tookMs, "output": truncate(output, 500)})
 }
 
-// composeDeploy — allowlist 디렉토리에서만, 고정 인자만. TAG는 compose가 ${TAG}로 소비.
-// 순서: ① git 동기화(디렉토리가 clone이면 — compose·설정 변경 전달, .env는 미추적이라 보존)
-//       ② 대상 서비스만 pull ③ 대상 서비스만 up (무관 이미지 갱신·재생성 차단)
-// (실측 2026-08-29: 이미지만 배포하면 compose 변경이 호스트에 영원히 안 닿는다)
-func (agent *Agent) composeDeploy(directory, imageTag, composeService string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+// composeDeploy — git pull + 호스트 재빌드 (사용자 결정 2026-08-29: 전달 채널 = git 하나).
+// 순서: ① fetch(요청 sha 포함되도록 depth 50) ② reset --hard <sha> — 정확히 그 커밋 배포
+//       ③ compose up -d --build <대상 서비스만> (무관 서비스 재생성 차단)
+func (agent *Agent) composeDeploy(directory, commitSha, composeService string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute) // 호스트 빌드 여유(backend gradle 수 분)
 	defer cancel()
-	commands := [][]string{}
-	if _, err := os.Stat(directory + "/.git"); err == nil {
-		commands = append(commands,
-			[]string{"git", "-C", directory, "fetch", "--depth=1", "origin", "main"},
-			[]string{"git", "-C", directory, "reset", "--hard", "origin/main"},
-		)
+	commands := [][]string{
+		{"git", "-C", directory, "fetch", "--depth=50", "origin", "main"},
+		{"git", "-C", directory, "reset", "--hard", commitSha},
 	}
-	pullArguments := []string{"docker", "compose", "pull"}
-	upArguments := []string{"docker", "compose", "up", "-d"}
+	upArguments := []string{"docker", "compose", "up", "-d", "--build"}
 	if composeService != "" {
-		pullArguments = append(pullArguments, composeService)
 		upArguments = append(upArguments, composeService)
 	}
-	commands = append(commands, pullArguments, upArguments)
+	commands = append(commands, upArguments)
 	var combined strings.Builder
 	for _, arguments := range commands {
 		command := exec.CommandContext(ctx, arguments[0], arguments[1:]...)
 		command.Dir = directory
-		command.Env = append(os.Environ(), "TAG="+imageTag)
 		output, err := command.CombinedOutput()
 		combined.Write(output)
 		if err != nil {

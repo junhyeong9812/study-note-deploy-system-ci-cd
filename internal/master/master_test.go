@@ -34,20 +34,20 @@ func TestDeployRejectsWithoutSecret(t *testing.T) {
 }
 
 func TestDeployRejectsUnknownService(t *testing.T) {
-	recorder := request(newTestMaster(t), true, `{"service":"evil","image_tag":"abc"}`)
+	recorder := request(newTestMaster(t), true, `{"service":"evil","commit_sha":"abc1234"}`)
 	if recorder.Code != 422 || !strings.Contains(recorder.Body.String(), "unknown_service") {
 		t.Fatalf("allowlist 밖 서비스가 통과: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 
-func TestDeployRejectsMissingTag(t *testing.T) {
+func TestDeployRejectsMissingSha(t *testing.T) {
 	if code := request(newTestMaster(t), true, `{"service":"llm"}`).Code; code != 422 {
-		t.Fatalf("tag 없는 요청이 통과: %d", code)
+		t.Fatalf("sha 없는 요청이 통과: %d", code)
 	}
 }
 
 func TestDeployAcceptsKnownService(t *testing.T) {
-	recorder := request(newTestMaster(t), true, `{"service":"llm","image_tag":"sha-abc"}`)
+	recorder := request(newTestMaster(t), true, `{"service":"llm","commit_sha":"abc1234def"}`)
 	if recorder.Code != 202 || !strings.Contains(recorder.Body.String(), `"success":true`) {
 		t.Fatalf("정상 요청 거절: %d %s", recorder.Code, recorder.Body.String())
 	}
