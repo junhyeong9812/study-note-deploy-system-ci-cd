@@ -5,7 +5,7 @@ services:
     build: .
     container_name: ci-cd-${MODE:?set-in-env}
     network_mode: host          # master→agent LAN 호출·agent의 로컬 compose 제어 단순화
-    env_file: .env
+    env_file: ${ENV_FILE:-.env}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock     # agent: 호스트 docker 제어
       - ${HOME}/study-note-deploy-system-front:${HOME}/study-note-deploy-system-front
