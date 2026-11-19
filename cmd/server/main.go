@@ -23,7 +23,12 @@ func main() {
 	var defaultPort string
 	switch mode {
 	case "master":
-		master.New(logger).Register(mux)
+		deployMaster, err := master.New(logger)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err) // fail-closed: 이력을 남길 수 없으면 뜨지 않는다
+			os.Exit(1)
+		}
+		deployMaster.Register(mux)
 		defaultPort = "15000"
 	case "agent":
 		agent.New(logger).Register(mux)

@@ -3,16 +3,27 @@ package master
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junhyeong9812/study-note-deploy-system-ci-cd/internal/shared"
 )
 
 func newTestMaster(t *testing.T) *Master {
 	t.Setenv("DEPLOY_SECRET", "test-value")
-	t.Setenv("AGENT_URL_LLM", "http://agent-llm:15001")
-	return New(shared.NewLogger())
+	if os.Getenv("AGENT_URL_LLM") == "" {
+		t.Setenv("AGENT_URL_LLM", "http://127.0.0.1:1") // 닫힌 포트 — 접수만 보는 테스트용
+	}
+	t.Setenv("DEPLOY_DB_PATH", filepath.Join(t.TempDir(), "deploys.db"))
+	master, err := New(shared.NewLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	master.busyRetryInterval, master.storeRetryInterval = 5*time.Millisecond, 20*time.Millisecond
+	return master
 }
 
 func request(master *Master, withSecret bool, body string) *httptest.ResponseRecorder {

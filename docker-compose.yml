@@ -1,4 +1,4 @@
-# 역할별 서비스 분리(리뷰 F4) — master는 docker.sock·저장소 마운트 없음(접수·라우팅만).
+# 역할별 서비스 분리(리뷰 F4) — master는 docker.sock·저장소 마운트 없음(접수·진행·이력만).
 # .9:      docker compose --profile master --profile agent up -d --build
 # 그 외:   docker compose --profile agent up -d --build
 services:
@@ -8,6 +8,10 @@ services:
     container_name: ci-cd-master
     network_mode: host
     env_file: .env.master
+    environment:
+      DEPLOY_DB_PATH: /data/deploys.db                 # 아래 볼륨과 짝 — 작업 디렉토리에 기대지 않는다
+    volumes:
+      - ./data:/data                                   # 배포 이력 DB(SQLite) — 재시작해도 남는다
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:15000/health"]
       interval: 30s

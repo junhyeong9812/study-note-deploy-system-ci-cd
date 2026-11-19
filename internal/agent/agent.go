@@ -4,6 +4,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,13 +26,18 @@ type Agent struct {
 	composeServices map[string]string
 	// 서비스 → 배포 후 헬스 URL. env DEPLOY_HEALTH_<SVC> — compose 성공 ≠ 서비스 정상 (리뷰 F7)
 	healthURLs map[string]string
-	busy        sync.Mutex // 한 번에 하나의 배포만 (호스트 자원 보호)
+	// 서비스 → 테스트 빌드 경로(배포 디렉토리 기준). env DEPLOY_TEST_CONTEXT_<SVC> — 없으면 "."
+	testContexts map[string]string
+	busy        sync.Mutex // 한 번에 하나의 작업만 (호스트 자원 보호)
+	run         commandRunner
+	waitHealthy func(healthURL string, budget time.Duration) error
 }
 
 func New(logger *shared.Logger) *Agent {
 	directories := map[string]string{}
 	composeServices := map[string]string{}
 	healthURLs := map[string]string{}
+	testContexts := map[string]string{}
 	for _, service := range []string{"front", "backend", "llm"} {
 		if directory := os.Getenv("DEPLOY_DIR_" + strings.ToUpper(service)); directory != "" {
 			directories[service] = directory
@@ -42,13 +48,74 @@ func New(logger *shared.Logger) *Agent {
 		if healthURL := os.Getenv("DEPLOY_HEALTH_" + strings.ToUpper(service)); healthURL != "" {
 			healthURLs[service] = healthURL
 		}
+		if testContext := os.Getenv("DEPLOY_TEST_CONTEXT_" + strings.ToUpper(service)); testContext != "" {
+			testContexts[service] = testContext
+		}
 	}
 	return &Agent{secret: os.Getenv("DEPLOY_SECRET"), logger: logger,
-		directories: directories, composeServices: composeServices, healthURLs: healthURLs}
+		directories: directories, composeServices: composeServices, healthURLs: healthURLs,
+		testContexts: testContexts, run: runCommand, waitHealthy: waitHealthy}
 }
 
 func (agent *Agent) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /agent/deploy", agent.handleDeploy)
+	mux.HandleFunc("POST /agent/deploy", agent.handleDeploy) // 구 경로 — master 전환 뒤 제거
+	mux.HandleFunc("POST /agent/ci", agent.handleStage("ci", agent.integrate))
+	mux.HandleFunc("POST /agent/cd", agent.handleStage("cd", agent.deliver))
+}
+
+// handleStage — CI·CD 공통 접수: 인증 → 서비스·sha 검증 → 한 번에 하나 → 실행 → 실패 단계를 코드로 응답.
+func (agent *Agent) handleStage(name string, execute func(service, commitSha string) (string, error)) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if !shared.SecretMatches(request, agent.secret) {
+			shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")
+			return
+		}
+		body, _ := io.ReadAll(io.LimitReader(request.Body, 4096))
+		var payload struct {
+			Service   string `json:"service"`
+			CommitSha string `json:"commit_sha"`
+			RequestID string `json:"request_id"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_request", "bad json")
+			return
+		}
+		requestID := shared.AcceptOrIssue(payload.RequestID)
+		if _, allowed := agent.directories[payload.Service]; !allowed {
+			shared.WriteFail(writer, http.StatusUnprocessableEntity, "unknown_service", payload.Service)
+			return
+		}
+		if agent.composeServices[payload.Service] == "" { // 대상이 없으면 compose 전체가 대상이 된다 — 거절
+			shared.WriteFail(writer, http.StatusUnprocessableEntity, "service_not_configured", "DEPLOY_SVC_"+strings.ToUpper(payload.Service))
+			return
+		}
+		if !shared.ValidCommitSha(payload.CommitSha) {
+			shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_sha", "")
+			return
+		}
+		if !agent.busy.TryLock() {
+			shared.WriteFail(writer, http.StatusConflict, "agent_busy", "")
+			return
+		}
+		defer agent.busy.Unlock()
+
+		startedAt := time.Now()
+		agent.logger.Log(requestID, fmt.Sprintf("agent %s start %s sha=%s", name, payload.Service, payload.CommitSha), "info")
+		output, err := execute(payload.Service, payload.CommitSha)
+		tookMs := time.Since(startedAt).Milliseconds()
+		if err != nil {
+			stage, detail := name+"_failed", output
+			var staged *stageError
+			if errors.As(err, &staged) {
+				stage, detail = staged.stage, staged.output
+			}
+			agent.logger.Log(requestID, fmt.Sprintf("agent %s failed %s stage=%s %dms: %s", name, payload.Service, stage, tookMs, tail(detail, 200)), "error")
+			shared.WriteFail(writer, http.StatusInternalServerError, stage, tail(detail, outputTailLimit))
+			return
+		}
+		agent.logger.Log(requestID, fmt.Sprintf("agent %s ok %s sha=%s %dms", name, payload.Service, payload.CommitSha, tookMs), "info")
+		shared.WriteOK(writer, map[string]any{"took_ms": tookMs, "output": tail(output, outputTailLimit)})
+	}
 }
 
 func (agent *Agent) handleDeploy(writer http.ResponseWriter, request *http.Request) {
@@ -129,27 +196,6 @@ func (agent *Agent) composeDeploy(directory, commitSha, composeService string) (
 		}
 	}
 	return combined.String(), nil
-}
-
-// waitHealthy — 배포 후 서비스 헬스가 200이 될 때까지 폴링 (기동 시간 감안)
-func waitHealthy(healthURL string, budget time.Duration) error {
-	deadline := time.Now().Add(budget)
-	client := &http.Client{Timeout: 3 * time.Second}
-	var lastError error
-	for time.Now().Before(deadline) {
-		response, err := client.Get(healthURL)
-		if err == nil {
-			response.Body.Close()
-			if response.StatusCode == http.StatusOK {
-				return nil
-			}
-			lastError = fmt.Errorf("status %d", response.StatusCode)
-		} else {
-			lastError = err
-		}
-		time.Sleep(3 * time.Second)
-	}
-	return fmt.Errorf("health 미도달: %v", lastError)
 }
 
 func truncate(input string, limit int) string {
