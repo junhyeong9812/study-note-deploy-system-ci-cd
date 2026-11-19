@@ -359,7 +359,13 @@ func TestStatePassesThroughEveryStage(t *testing.T) {
 		t.Fatalf("CI가 끝나기 전에 CD로 넘어갔다: %s", calls)
 	}
 	close(holdIntegration)
-	waitState(t, master, "gh-11-1", StateDelivering)
+	deadline := time.Now().Add(5 * time.Second) // CD 요청이 실제로 agent에 붙잡힌 뒤에 상태를 본다
+	for agent.called() != "/agent/ci,/agent/cd" && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if state := lookup(t, master, "gh-11-1").State; agent.called() != "/agent/ci,/agent/cd" || state != StateDelivering {
+		t.Fatalf("CD가 진행 중일 때 상태는 cd_running이어야 한다: %s calls=%s", state, agent.called())
+	}
 	close(holdDelivery)
 	released = true
 	if deployment := waitFinished(t, master, "gh-11-1"); deployment.State != StateSucceeded {
@@ -392,6 +398,13 @@ func TestFinishedResultIsServedFromMemoryUntilStoreRecovers(t *testing.T) {
 	}
 	if recorded, _, _ := store.deploymentStore.Find("gh-13-1"); recorded.State != StateIntegrating {
 		t.Fatalf("테스트 전제 오류 — DB에 이미 기록됨: %+v", recorded)
+	}
+	// 복구 전에도 이력·재접수가 단건 조회와 같은 결과를 보여야 한다
+	if body := call(master, "GET", "/deploys?service=llm", "").Body.String(); !strings.Contains(body, `"failed_stage":"ci_test"`) {
+		t.Fatalf("이력이 DB의 진행 중 상태를 그대로 보여 준다: %s", body)
+	}
+	if body := submit(master, "gh-13-1").Body.String(); !strings.Contains(body, `"state":"failed"`) {
+		t.Fatalf("재접수가 DB의 진행 중 상태를 돌려준다: %s", body)
 	}
 	store.setFailOnState("") // DB 복구
 	deadline := time.Now().Add(5 * time.Second)
@@ -436,5 +449,19 @@ func TestOkStatusWithoutSuccessEnvelopeIsNotSuccess(t *testing.T) {
 	deployment := waitFinished(t, master, "gh-16-1")
 	if deployment.State != StateFailed || agent.called() != "/agent/ci" {
 		t.Fatalf("봉투 없는 200을 성공으로 쳤다: %+v calls=%s", deployment, agent.called())
+	}
+}
+
+func TestBusyRetriesAreSharedAcrossBothStages(t *testing.T) {
+	agent := newFakeAgent(t)
+	agent.busyTimes = busyRetryLimit + 5 // 끝내 비지 않는다
+	master := newTestMaster(t)
+	submit(master, "gh-17-1")
+	deployment := waitFinished(t, master, "gh-17-1")
+	if deployment.FailedStage != StageAgentRejected || !strings.Contains(deployment.Detail, "agent_busy") {
+		t.Fatalf("대기 상한을 넘으면 agent_rejected(agent_busy)여야 한다: %+v", deployment)
+	}
+	if calls := strings.Count(agent.called(), "/agent/"); calls != busyRetryLimit+1 {
+		t.Fatalf("재호출 횟수가 상한과 다르다: %d", calls)
 	}
 }

@@ -20,7 +20,7 @@ const (
 	// 합계가 워크플로 조회 상한(20분) 안에 들어와야 한다: 작업 중 대기 3분 + CI 11.5분 + CD 5분
 	integrationCallTimeout = 11*time.Minute + 30*time.Second // agent CI 예산 10분 + 원복 1분 + 여유
 	deliveryCallTimeout    = 5 * time.Minute                 // agent 교체 2분 + 헬스 90초 + 이미지 정리 1분 + 여유
-	busyRetryLimit         = 12                              // agent가 다른 작업 중일 때 다시 불러 보는 횟수
+	busyRetryLimit         = 12                              // agent가 다른 작업 중일 때 다시 불러 보는 횟수 — 배포 한 건 전체(CI+CD) 합계
 	detailLimit            = 2000
 
 	StageAgentUnreachable = "agent_unreachable"
@@ -127,6 +127,7 @@ func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	if found {
+		existing = master.actual(existing)
 		if existing.Service != deploy.Service || existing.CommitSha != deploy.CommitSha {
 			shared.WriteFail(writer, http.StatusConflict, "request_id_conflict", "")
 			return
@@ -180,8 +181,9 @@ func (master *Master) advance(deployment Deployment, agentURL string) {
 	if !enter(StateIntegrating) {
 		return
 	}
+	busyRetries := busyRetryLimit // CI와 CD가 나눠 쓴다 — 단계마다 따로 주면 합계가 조회 상한을 넘는다
 	startedAt := time.Now()
-	stage, detail := master.callAgentWhenFree(agentURL+"/agent/ci", deployment, integrationCallTimeout)
+	stage, detail := master.callAgentWhenFree(agentURL+"/agent/ci", deployment, integrationCallTimeout, &busyRetries)
 	deployment.IntegrationMs = time.Since(startedAt).Milliseconds()
 	if stage != "" {
 		fail(stage, detail)
@@ -191,7 +193,7 @@ func (master *Master) advance(deployment Deployment, agentURL string) {
 		return
 	}
 	startedAt = time.Now()
-	stage, detail = master.callAgentWhenFree(agentURL+"/agent/cd", deployment, deliveryCallTimeout)
+	stage, detail = master.callAgentWhenFree(agentURL+"/agent/cd", deployment, deliveryCallTimeout, &busyRetries)
 	deployment.DeliveryMs = time.Since(startedAt).Milliseconds()
 	if stage != "" {
 		fail(stage, detail)
@@ -232,14 +234,33 @@ func (master *Master) recordFinished(deployment Deployment) {
 	}()
 }
 
+// actual — DB에 아직 기록하지 못한 종단 결과가 있으면 그것을 돌려준다. 단건 조회·이력·재접수가 같은 값을 보게 한다.
+// 호출하는 쪽이 master.mutex를 쥐고 있어야 한다.
+func (master *Master) actual(deployment Deployment) Deployment {
+	if pending, unrecorded := master.unrecorded[deployment.RequestID]; unrecorded {
+		return pending
+	}
+	return deployment
+}
+
+func (master *Master) actualAll(deployments []Deployment) []Deployment {
+	master.mutex.Lock()
+	defer master.mutex.Unlock()
+	for index := range deployments {
+		deployments[index] = master.actual(deployments[index])
+	}
+	return deployments
+}
+
 // callAgentWhenFree — agent가 다른 작업 중(409 agent_busy)이면 간격을 두고 다시 부른다.
 // master가 재시작된 직후에는 agent가 앞선 작업을 아직 끝내지 못했을 수 있다.
-func (master *Master) callAgentWhenFree(url string, deployment Deployment, timeout time.Duration) (stage, detail string) {
-	for attempt := 0; ; attempt++ {
+func (master *Master) callAgentWhenFree(url string, deployment Deployment, timeout time.Duration, busyRetries *int) (stage, detail string) {
+	for {
 		stage, detail = master.callAgent(url, deployment, timeout)
-		if stage != "agent_busy" || attempt >= busyRetryLimit {
+		if stage != "agent_busy" || *busyRetries <= 0 {
 			break
 		}
+		*busyRetries--
 		time.Sleep(master.busyRetryInterval)
 	}
 	if stage != "" && stage != StageAgentUnreachable && !agentStages[stage] {
@@ -284,15 +305,7 @@ func (master *Master) handleDeployment(writer http.ResponseWriter, request *http
 		shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")
 		return
 	}
-	requestID := request.PathValue("requestID")
-	master.mutex.Lock()
-	pending, unrecorded := master.unrecorded[requestID]
-	master.mutex.Unlock()
-	if unrecorded { // DB에는 아직 진행 중으로 남아 있다 — 실제 결과를 돌려준다
-		shared.WriteOK(writer, pending)
-		return
-	}
-	deployment, found, err := master.store.Find(requestID)
+	deployment, found, err := master.store.Find(request.PathValue("requestID"))
 	if err != nil {
 		shared.WriteFail(writer, http.StatusInternalServerError, StageStore, "")
 		return
@@ -301,6 +314,9 @@ func (master *Master) handleDeployment(writer http.ResponseWriter, request *http
 		shared.WriteFail(writer, http.StatusNotFound, "not_found", "")
 		return
 	}
+	master.mutex.Lock()
+	deployment = master.actual(deployment) // DB에는 아직 진행 중으로 남아 있을 수 있다
+	master.mutex.Unlock()
 	shared.WriteOK(writer, deployment)
 }
 
@@ -321,7 +337,7 @@ func (master *Master) handleDeployments(writer http.ResponseWriter, request *htt
 		shared.WriteFail(writer, http.StatusInternalServerError, StageStore, "")
 		return
 	}
-	shared.WriteOK(writer, map[string]any{"deployments": deployments})
+	shared.WriteOK(writer, map[string]any{"deployments": master.actualAll(deployments)})
 }
 
 func (master *Master) handleStatus(writer http.ResponseWriter, request *http.Request) {
@@ -334,7 +350,7 @@ func (master *Master) handleStatus(writer http.ResponseWriter, request *http.Req
 		shared.WriteFail(writer, http.StatusInternalServerError, StageStore, "")
 		return
 	}
-	shared.WriteOK(writer, map[string]any{"services": keys(master.agents), "history": history})
+	shared.WriteOK(writer, map[string]any{"services": keys(master.agents), "history": master.actualAll(history)})
 }
 
 func keys(input map[string]string) []string {
