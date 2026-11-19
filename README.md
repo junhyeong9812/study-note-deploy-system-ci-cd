@@ -19,20 +19,22 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 ## 상태와 API
 
 - 상태: `accepted → ci_running → cd_running → succeeded | failed`. `failed` 에는 `failed_stage` 와 출력 끝부분이 붙는다.
-- 실패 단계: `ci_fetch` · `ci_test` · `ci_build` · `cd_up` · `cd_health` · `agent_unreachable` · `agent_busy` · `store_failed` · `interrupted`(master 재시작)
+- 실패 단계: `ci_fetch` · `ci_test` · `ci_build` · `cd_up` · `cd_health` · `agent_unreachable` · `agent_rejected`(agent 가 단계 전에 거절 — 설정 누락·계속 작업 중. 사유는 `detail`) · `store_failed`(이력 기록 실패) · `interrupted`(master 재시작)
+- 시간 예산: agent 작업 중 대기 3분 + CI 11.5분 + CD 5분 — 워크플로 조회 상한 20분 안
 
 | API | 설명 |
 |---|---|
 | `POST /deploy` | 접수(202). 같은 `request_id` 를 다시 보내면 새 배포 없이 기존 건의 상태를 돌려준다. 같은 서비스가 진행 중이면 409 |
 | `GET /deploys/{request_id}` | 한 건의 상태 |
 | `GET /deploys?service=&limit=` | 이력(최신순, 기본 50·최대 200) |
-| `GET /status` | 서비스 목록 + 최근 50건 |
+| `GET /status` | 서비스 목록 + 최근 50건(최신순, 원소는 `/deploys` 와 같은 형태) |
 
 ## 대상 repo가 지켜야 할 것
 
 - Dockerfile 에 `test` 단계 — agent 는 `docker build --target test <경로>` 만 실행한다. 무엇을 돌릴지는 repo 가 정한다.
-- compose 대상 서비스에 `image: <이름>:${IMAGE_TAG:-current}` — CI 가 sha 태그로 빌드하고 CD 가 그 태그로 교체한다.
-- 되돌리기: 이전 커밋으로 접수를 다시 보낸다. 서비스별 최근 5개 sha 이미지를 남긴다.
+- compose 대상 서비스에 `image: <이름>:${IMAGE_TAG:-local}` — CI 가 sha 태그로 빌드하고 CD 가 그 태그로 교체한다.
+- 되돌리기: 이전 커밋으로 접수를 다시 보낸다. 서비스별 최근 5개 sha 이미지를 남긴다(이미지 이름은 실행 중인 컨테이너에서 읽는다).
+- 서버에서 손으로 올릴 때: `IMAGE_TAG=<운영 중인 sha> docker compose up -d --no-build --no-deps <대상>`. `IMAGE_TAG` 없이 `up` 하면 `local` 태그로 그 자리에서 빌드해 컨테이너를 다시 만든다.
 
 - 규약: 봉투(success/error) · 로그 `requestId:server-name:message`(stdout+Redis XADD 실패무해)
 - 가드: fail-closed 시크릿(상수시간) · 서비스/디렉토리 고정 열거 · 커밋 sha hex 검증(**master가 접수 전에**) · master 서비스별 + agent single-flight · CI 실패 시 CD 미호출 · 배포 후 헬스 확인(DEPLOY_HEALTH_*) · 이력을 기록하지 못하면 접수 거절 · http 타임아웃

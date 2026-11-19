@@ -28,8 +28,6 @@ type Agent struct {
 	healthURLs map[string]string
 	// 서비스 → 테스트 빌드 경로(배포 디렉토리 기준). env DEPLOY_TEST_CONTEXT_<SVC> — 없으면 "."
 	testContexts map[string]string
-	// 서비스 → 이미지 이름(태그 제외). env DEPLOY_IMAGE_<SVC> — current 꼬리표·오래된 이미지 정리에 쓴다
-	imageNames  map[string]string
 	busy        sync.Mutex // 한 번에 하나의 작업만 (호스트 자원 보호)
 	run         commandRunner
 	waitHealthy func(healthURL string, budget time.Duration) error
@@ -40,7 +38,6 @@ func New(logger *shared.Logger) *Agent {
 	composeServices := map[string]string{}
 	healthURLs := map[string]string{}
 	testContexts := map[string]string{}
-	imageNames := map[string]string{}
 	for _, service := range []string{"front", "backend", "llm"} {
 		if directory := os.Getenv("DEPLOY_DIR_" + strings.ToUpper(service)); directory != "" {
 			directories[service] = directory
@@ -54,13 +51,10 @@ func New(logger *shared.Logger) *Agent {
 		if testContext := os.Getenv("DEPLOY_TEST_CONTEXT_" + strings.ToUpper(service)); testContext != "" {
 			testContexts[service] = testContext
 		}
-		if imageName := os.Getenv("DEPLOY_IMAGE_" + strings.ToUpper(service)); imageName != "" {
-			imageNames[service] = imageName
-		}
 	}
 	return &Agent{secret: os.Getenv("DEPLOY_SECRET"), logger: logger,
 		directories: directories, composeServices: composeServices, healthURLs: healthURLs,
-		testContexts: testContexts, imageNames: imageNames, run: runCommand, waitHealthy: waitHealthy}
+		testContexts: testContexts, run: runCommand, waitHealthy: waitHealthy}
 }
 
 func (agent *Agent) Register(mux *http.ServeMux) {
@@ -89,6 +83,10 @@ func (agent *Agent) handleStage(name string, execute func(service, commitSha str
 		requestID := shared.AcceptOrIssue(payload.RequestID)
 		if _, allowed := agent.directories[payload.Service]; !allowed {
 			shared.WriteFail(writer, http.StatusUnprocessableEntity, "unknown_service", payload.Service)
+			return
+		}
+		if agent.composeServices[payload.Service] == "" { // 대상이 없으면 compose 전체가 대상이 된다 — 거절
+			shared.WriteFail(writer, http.StatusUnprocessableEntity, "service_not_configured", "DEPLOY_SVC_"+strings.ToUpper(payload.Service))
 			return
 		}
 		if !shared.ValidCommitSha(payload.CommitSha) {

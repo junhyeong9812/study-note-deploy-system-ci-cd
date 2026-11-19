@@ -17,14 +17,20 @@ import (
 )
 
 const (
-	integrationCallTimeout = 13 * time.Minute // agent CI 예산 12분 + 여유
-	deliveryCallTimeout    = 6 * time.Minute  // agent CD 예산 3분 + 헬스 90초 + 여유
+	// 합계가 워크플로 조회 상한(20분) 안에 들어와야 한다: 작업 중 대기 3분 + CI 11.5분 + CD 5분
+	integrationCallTimeout = 11*time.Minute + 30*time.Second // agent CI 예산 10분 + 원복 1분 + 여유
+	deliveryCallTimeout    = 5 * time.Minute                 // agent 교체 2분 + 헬스 90초 + 이미지 정리 1분 + 여유
+	busyRetryLimit         = 12                              // agent가 다른 작업 중일 때 다시 불러 보는 횟수
 	detailLimit            = 2000
 
 	StageAgentUnreachable = "agent_unreachable"
+	StageAgentRejected    = "agent_rejected" // agent가 단계에 들어가기 전에 거절(설정 누락·작업 중 등)
 	StageInterrupted      = "interrupted"
 	StageStore            = "store_failed"
 )
+
+// agent가 알려 주는 실패 단계 — 이 밖의 코드는 agent_rejected로 묶는다(이력의 단계 집합을 닫아 둔다).
+var agentStages = map[string]bool{"ci_fetch": true, "ci_test": true, "ci_build": true, "cd_up": true, "cd_health": true}
 
 type DeployRequest struct {
 	Service   string `json:"service"`
@@ -39,6 +45,10 @@ type Master struct {
 	store    deploymentStore
 	mutex    sync.Mutex
 	inFlight map[string]bool // 서비스별 single-flight — 진행 중이면 명시적 409
+	// 끝났지만 DB에 기록하지 못한 건. 조회는 이 값을 우선하고, 기록될 때까지 주기적으로 다시 쓴다.
+	unrecorded         map[string]Deployment
+	busyRetryInterval  time.Duration
+	storeRetryInterval time.Duration
 }
 
 // New — 이력 DB를 열고, 지난 실행에서 끝나지 못한 건을 실패로 닫는다. DB를 못 열면 뜨지 않는다(fail-closed).
@@ -59,7 +69,8 @@ func New(logger *shared.Logger) (*Master, error) {
 		return nil, fmt.Errorf("이력 DB 열기 실패(%s): %w", path, err)
 	}
 	master := &Master{secret: os.Getenv("DEPLOY_SECRET"), logger: logger, agents: agents,
-		store: store, inFlight: map[string]bool{}}
+		store: store, inFlight: map[string]bool{}, unrecorded: map[string]Deployment{},
+		busyRetryInterval: 15 * time.Second, storeRetryInterval: 30 * time.Second}
 	closed, err := store.FailUnfinished(StageInterrupted, "master가 진행 중에 재시작됨", now())
 	if err != nil {
 		return nil, fmt.Errorf("미완료 건 정리 실패: %w", err)
@@ -155,9 +166,7 @@ func (master *Master) advance(deployment Deployment, agentURL string) {
 		deployment.Detail, deployment.FinishedAt = lastPart(detail, detailLimit), now()
 		master.logger.Log(deployment.RequestID, fmt.Sprintf("deploy failed %s sha=%s stage=%s %s",
 			deployment.Service, deployment.CommitSha, stage, lastPart(detail, 200)), "error")
-		if err := master.store.Update(deployment); err != nil {
-			master.logger.Log(deployment.RequestID, "deploy 결과 기록 실패: "+err.Error(), "error")
-		}
+		master.recordFinished(deployment)
 	}
 	enter := func(state string) bool {
 		deployment.State = state
@@ -172,7 +181,7 @@ func (master *Master) advance(deployment Deployment, agentURL string) {
 		return
 	}
 	startedAt := time.Now()
-	stage, detail := master.callAgent(agentURL+"/agent/ci", deployment, integrationCallTimeout)
+	stage, detail := master.callAgentWhenFree(agentURL+"/agent/ci", deployment, integrationCallTimeout)
 	deployment.IntegrationMs = time.Since(startedAt).Milliseconds()
 	if stage != "" {
 		fail(stage, detail)
@@ -182,7 +191,7 @@ func (master *Master) advance(deployment Deployment, agentURL string) {
 		return
 	}
 	startedAt = time.Now()
-	stage, detail = master.callAgent(agentURL+"/agent/cd", deployment, deliveryCallTimeout)
+	stage, detail = master.callAgentWhenFree(agentURL+"/agent/cd", deployment, deliveryCallTimeout)
 	deployment.DeliveryMs = time.Since(startedAt).Milliseconds()
 	if stage != "" {
 		fail(stage, detail)
@@ -190,15 +199,56 @@ func (master *Master) advance(deployment Deployment, agentURL string) {
 	}
 	deployment.State, deployment.FinishedAt = StateSucceeded, now()
 	if err := master.store.Update(deployment); err != nil {
-		// 운영은 이미 바뀌었지만 성공을 기록하지 못했다 — 조회는 cd_running에 머물고 워크플로는 시간 초과로 실패한다
-		master.logger.Log(deployment.RequestID, "deploy 성공 기록 실패(운영은 교체됨): "+err.Error(), "error")
+		// 운영은 이미 바뀌었지만 이력에 남기지 못했다 — 기록 없는 성공은 성공으로 치지 않는다
+		fail(StageStore, fmt.Sprintf("운영은 %s 로 교체됐으나 성공 기록 실패: %s", deployment.CommitSha, err.Error()))
 		return
 	}
 	master.logger.Log(deployment.RequestID, fmt.Sprintf("deploy succeeded %s sha=%s ci=%dms cd=%dms",
 		deployment.Service, deployment.CommitSha, deployment.IntegrationMs, deployment.DeliveryMs), "info")
 }
 
-// callAgent — 성공이면 stage가 빈 문자열. 실패면 agent가 알려 준 단계(없으면 agent_failed)와 출력.
+// recordFinished — 끝난 결과를 DB에 쓴다. 쓰지 못하면 메모리에 들고(조회가 진행 중으로 보이지 않게)
+// 기록될 때까지 주기적으로 다시 쓴다. 그사이 master가 재시작하면 그 행은 failed(interrupted)로 닫힌다.
+func (master *Master) recordFinished(deployment Deployment) {
+	if err := master.store.Update(deployment); err == nil {
+		return
+	} else {
+		master.logger.Log(deployment.RequestID, "deploy 결과 기록 실패 — 메모리에 보관하고 재시도: "+err.Error(), "error")
+	}
+	master.mutex.Lock()
+	master.unrecorded[deployment.RequestID] = deployment
+	master.mutex.Unlock()
+	go func() {
+		for {
+			time.Sleep(master.storeRetryInterval)
+			if err := master.store.Update(deployment); err == nil {
+				master.mutex.Lock()
+				delete(master.unrecorded, deployment.RequestID)
+				master.mutex.Unlock()
+				master.logger.Log(deployment.RequestID, "deploy 결과 기록 복구됨", "warning")
+				return
+			}
+		}
+	}()
+}
+
+// callAgentWhenFree — agent가 다른 작업 중(409 agent_busy)이면 간격을 두고 다시 부른다.
+// master가 재시작된 직후에는 agent가 앞선 작업을 아직 끝내지 못했을 수 있다.
+func (master *Master) callAgentWhenFree(url string, deployment Deployment, timeout time.Duration) (stage, detail string) {
+	for attempt := 0; ; attempt++ {
+		stage, detail = master.callAgent(url, deployment, timeout)
+		if stage != "agent_busy" || attempt >= busyRetryLimit {
+			break
+		}
+		time.Sleep(master.busyRetryInterval)
+	}
+	if stage != "" && stage != StageAgentUnreachable && !agentStages[stage] {
+		return StageAgentRejected, stage + ": " + detail
+	}
+	return stage, detail
+}
+
+// callAgent — 성공이면 stage가 빈 문자열. 실패면 agent가 알려 준 코드와 출력.
 func (master *Master) callAgent(url string, deployment Deployment, timeout time.Duration) (stage, detail string) {
 	payload, _ := json.Marshal(map[string]string{
 		"service": deployment.Service, "commit_sha": deployment.CommitSha, "request_id": deployment.RequestID,
@@ -212,17 +262,19 @@ func (master *Master) callAgent(url string, deployment Deployment, timeout time.
 	}
 	defer response.Body.Close()
 	responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 16384))
-	if response.StatusCode == http.StatusOK {
-		return "", ""
-	}
 	var envelope struct {
-		Error struct {
+		Success bool `json:"success"`
+		Error   struct {
 			Code   string `json:"code"`
 			Detail string `json:"detail"`
 		} `json:"error"`
 	}
-	if err := json.Unmarshal(responseBody, &envelope); err != nil || envelope.Error.Code == "" {
-		return "agent_failed", fmt.Sprintf("status %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
+	parseErr := json.Unmarshal(responseBody, &envelope)
+	if response.StatusCode == http.StatusOK && parseErr == nil && envelope.Success {
+		return "", ""
+	}
+	if parseErr != nil || envelope.Error.Code == "" { // agent의 봉투가 아니다 — 200이어도 성공으로 치지 않는다
+		return "unexpected_response", fmt.Sprintf("status %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
 	}
 	return envelope.Error.Code, envelope.Error.Detail
 }
@@ -232,7 +284,15 @@ func (master *Master) handleDeployment(writer http.ResponseWriter, request *http
 		shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")
 		return
 	}
-	deployment, found, err := master.store.Find(request.PathValue("requestID"))
+	requestID := request.PathValue("requestID")
+	master.mutex.Lock()
+	pending, unrecorded := master.unrecorded[requestID]
+	master.mutex.Unlock()
+	if unrecorded { // DB에는 아직 진행 중으로 남아 있다 — 실제 결과를 돌려준다
+		shared.WriteOK(writer, pending)
+		return
+	}
+	deployment, found, err := master.store.Find(requestID)
 	if err != nil {
 		shared.WriteFail(writer, http.StatusInternalServerError, StageStore, "")
 		return

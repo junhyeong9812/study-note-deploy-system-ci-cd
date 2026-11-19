@@ -24,11 +24,11 @@ const (
 )
 
 const (
-	continuousIntegrationBudget = 12 * time.Minute // 테스트 + 이미지 빌드 (backend gradle 수 분)
-	continuousDeliveryBudget    = 3 * time.Minute  // 이미지 교체만 — 빌드는 CI에서 끝났다
+	continuousIntegrationBudget = 10 * time.Minute // 테스트 + 이미지 빌드 (backend gradle 수 분)
+	continuousDeliveryBudget    = 2 * time.Minute  // 이미지 교체만 — 빌드는 CI에서 끝났다
 	healthBudget                = 90 * time.Second
-	keptImageTags               = 5 // 되돌리기용으로 남기는 sha 이미지 수 (디스크 상한)
-	currentImageTag             = "current"
+	retainBudget                = time.Minute // 이미지 정리 — 교체·헬스가 쓴 시간과 별개
+	keptImageTags               = 5           // 되돌리기용으로 남기는 sha 이미지 수 (디스크 상한)
 	outputTailLimit             = 2000
 )
 
@@ -65,6 +65,12 @@ func (agent *Agent) integrate(service, commitSha string) (string, error) {
 	if err != nil || !shared.ValidCommitSha(previousSha) {
 		return previousSha, &stageError{StageFetch, "현재 커밋 확인 실패: " + previousSha}
 	}
+	// 되돌릴 기준은 "운영 중인 버전"이다. 앞선 배포가 CI만 통과하고 CD에서 실패했다면 HEAD는 운영과 다르다.
+	if _, runningSha := agent.runningImage(ctx, directory, service); shared.ValidCommitSha(runningSha) {
+		previousSha = runningSha
+	} else { // 실행 중인 컨테이너가 없거나 sha 태그 이전 방식으로 떠 있다 — 알 수 있는 기준은 HEAD뿐
+		agent.logger.Log("ci", fmt.Sprintf("운영 버전 확인 불가 %s(태그 %q) — 원복 기준을 HEAD %s 로", service, runningSha, previousSha), "warning")
+	}
 	step := func(stage string, arguments ...string) error {
 		output, err := agent.run(ctx, directory, imageTagEnvironment(commitSha), arguments...)
 		combined.WriteString(output)
@@ -96,11 +102,7 @@ func (agent *Agent) integrate(service, commitSha string) (string, error) {
 	if err := step(StageTest, "docker", "build", "--target", "test", agent.testContext(service)); err != nil {
 		return restore(err)
 	}
-	buildArguments := []string{"docker", "compose", "build"}
-	if composeService := agent.composeServices[service]; composeService != "" {
-		buildArguments = append(buildArguments, composeService)
-	}
-	if err := step(StageBuild, buildArguments...); err != nil {
+	if err := step(StageBuild, "docker", "compose", "build", agent.composeServices[service]); err != nil {
 		return restore(err)
 	}
 	return combined.String(), nil
@@ -113,37 +115,54 @@ func (agent *Agent) testContext(service string) string {
 	return "."
 }
 
+// runningImage — 지금 실행 중인 대상 컨테이너의 이미지 이름과 태그. 알 수 없으면 빈 문자열.
+func (agent *Agent) runningImage(ctx context.Context, directory, service string) (name, tag string) {
+	containerIDs, err := agent.run(ctx, directory, nil, "docker", "compose", "ps", "-q", agent.composeServices[service])
+	containerID, _, _ := strings.Cut(strings.TrimSpace(containerIDs), "\n")
+	if err != nil || containerID == "" {
+		return "", ""
+	}
+	image, err := agent.run(ctx, directory, nil, "docker", "inspect", "--format", "{{.Config.Image}}", containerID)
+	if err != nil {
+		return "", ""
+	}
+	image = strings.TrimSpace(image)
+	separator := strings.LastIndex(image, ":")
+	if separator < 0 {
+		return image, ""
+	}
+	return image[:separator], image[separator+1:]
+}
+
 // deliver — CD: CI가 만든 sha 이미지로 대상 컨테이너만 교체. 빌드하지 않고 의존 서비스도 건드리지 않는다.
 func (agent *Agent) deliver(service, commitSha string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), continuousDeliveryBudget)
 	defer cancel()
 	directory := agent.directories[service]
-	upArguments := []string{"docker", "compose", "up", "-d", "--no-build", "--no-deps"}
-	if composeService := agent.composeServices[service]; composeService != "" {
-		upArguments = append(upArguments, composeService)
+	healthURL := agent.healthURLs[service]
+	if healthURL == "" { // 헬스를 확인할 수 없는 배포는 성공이라 말할 수 없다 — 운영을 바꾸기 전에 거절
+		return "", &stageError{StageHealth, "DEPLOY_HEALTH_" + strings.ToUpper(service) + " 미설정 — 교체하지 않음"}
 	}
-	output, err := agent.run(ctx, directory, imageTagEnvironment(commitSha), upArguments...)
+	output, err := agent.run(ctx, directory, imageTagEnvironment(commitSha),
+		"docker", "compose", "up", "-d", "--no-build", "--no-deps", agent.composeServices[service])
 	if err != nil {
 		return output, &stageError{StageUp, output + "\n" + err.Error()}
 	}
-	if healthURL := agent.healthURLs[service]; healthURL != "" {
-		if err := agent.waitHealthy(healthURL, healthBudget); err != nil { // compose 성공 ≠ 서비스 정상
-			return output, &stageError{StageHealth, err.Error()}
-		}
+	if err := agent.waitHealthy(healthURL, healthBudget); err != nil { // compose 성공 ≠ 서비스 정상
+		return output, &stageError{StageHealth, err.Error()}
 	}
-	agent.retainImages(ctx, directory, service, commitSha)
+	agent.retainImages(directory, service, commitSha)
 	return output, nil
 }
 
-// retainImages — 교체 성공 뒤: 지금 버전에 `current` 꼬리표를 붙이고(IMAGE_TAG 없이 수동 기동할 때의 기본값),
-// 오래된 sha 이미지를 지운다. 실패해도 배포 결과는 바꾸지 않는다(정리 작업).
-func (agent *Agent) retainImages(ctx context.Context, directory, service, commitSha string) {
-	imageName := agent.imageNames[service]
-	if imageName == "" {
+// retainImages — 교체 성공 뒤 오래된 sha 이미지를 지운다(디스크 상한). 실패해도 배포 결과는 바꾸지 않되 로그에 남긴다.
+func (agent *Agent) retainImages(directory, service, commitSha string) {
+	ctx, cancel := context.WithTimeout(context.Background(), retainBudget)
+	defer cancel()
+	imageName, runningTag := agent.runningImage(ctx, directory, service)
+	if imageName == "" || runningTag != commitSha {
+		agent.logger.Log("retain", fmt.Sprintf("image 정리 생략 %s: 실행 중 이미지 %q:%q 가 배포한 sha와 다름", service, imageName, runningTag), "warning")
 		return
-	}
-	if output, err := agent.run(ctx, directory, nil, "docker", "tag", imageName+":"+commitSha, imageName+":"+currentImageTag); err != nil {
-		agent.logger.Log("retain", fmt.Sprintf("image tag current 실패 %s: %s", service, tail(output, 200)), "warning")
 	}
 	listing, err := agent.run(ctx, directory, nil, "docker", "images", imageName, "--format", "{{.CreatedAt}}\t{{.Tag}}")
 	if err != nil {
@@ -157,14 +176,14 @@ func (agent *Agent) retainImages(ctx context.Context, directory, service, commit
 	}
 }
 
-// staleImageTags — `생성시각\t태그` 줄 목록에서, 최근 keptImageTags개와 지금 배포한 것을 뺀 sha 태그.
+// staleImageTags — `생성시각\t태그` 줄 목록에서 지울 sha 태그. 남기는 것은 지금 배포한 태그 + 최신순으로 합계 keptImageTags개.
 // 생성시각 문자열(예: 2026-11-19 20:15:33 +0900 KST)은 사전순 = 시간순이라 그대로 정렬한다.
 func staleImageTags(listing, deployedSha string) []string {
 	type taggedImage struct{ createdAt, tag string }
 	var images []taggedImage
 	for _, line := range strings.Split(strings.TrimSpace(listing), "\n") {
 		createdAt, tag, found := strings.Cut(line, "\t")
-		if !found || !shared.ValidCommitSha(tag) { // current·<none> 등은 대상이 아니다
+		if !found || !shared.ValidCommitSha(tag) || tag == deployedSha { // local·<none> 등은 대상이 아니다
 			continue
 		}
 		images = append(images, taggedImage{createdAt, tag})
@@ -172,7 +191,7 @@ func staleImageTags(listing, deployedSha string) []string {
 	sort.SliceStable(images, func(left, right int) bool { return images[left].createdAt > images[right].createdAt })
 	var stale []string
 	for index, image := range images {
-		if index >= keptImageTags && image.tag != deployedSha {
+		if index >= keptImageTags-1 { // 한 자리는 지금 배포한 태그 몫
 			stale = append(stale, image.tag)
 		}
 	}

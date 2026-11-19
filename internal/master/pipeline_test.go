@@ -18,12 +18,15 @@ const deploySha = "abc1234def"
 
 // fakeAgent — /agent/ci·/agent/cd 호출을 기록하고, 정해 둔 단계를 실패시키거나 붙잡아 둔다.
 type fakeAgent struct {
-	mutex    sync.Mutex
-	calls    []string
-	failPath string
-	failCode string
-	hold     chan struct{} // nil이 아니면 CI가 닫힐 때까지 기다린다
-	server   *httptest.Server
+	mutex      sync.Mutex
+	calls      []string
+	failPath   string
+	failCode   string
+	failStatus int                      // 0이면 500
+	busyTimes  int                      // 처음 이만큼은 409 agent_busy
+	rawBody    string                   // 비어 있지 않으면 200에 이 본문을 그대로 돌려준다
+	holds      map[string]chan struct{} // 경로별 — 닫힐 때까지 그 단계에 머문다
+	server     *httptest.Server
 }
 
 func newFakeAgent(t *testing.T) *fakeAgent {
@@ -31,13 +34,29 @@ func newFakeAgent(t *testing.T) *fakeAgent {
 	agent.server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		agent.mutex.Lock()
 		agent.calls = append(agent.calls, request.URL.Path)
-		failPath, failCode, hold := agent.failPath, agent.failCode, agent.hold
+		failPath, failCode, failStatus, rawBody := agent.failPath, agent.failCode, agent.failStatus, agent.rawBody
+		hold := agent.holds[request.URL.Path]
+		busy := agent.busyTimes > 0
+		if busy {
+			agent.busyTimes--
+		}
 		agent.mutex.Unlock()
-		if hold != nil && request.URL.Path == "/agent/ci" {
+		if busy {
+			shared.WriteFail(writer, http.StatusConflict, "agent_busy", "")
+			return
+		}
+		if hold != nil {
 			<-hold
 		}
+		if rawBody != "" {
+			writer.Write([]byte(rawBody))
+			return
+		}
 		if request.URL.Path == failPath {
-			shared.WriteFail(writer, http.StatusInternalServerError, failCode, "FAILED test_queue.py::test_order")
+			if failStatus == 0 {
+				failStatus = http.StatusInternalServerError
+			}
+			shared.WriteFail(writer, failStatus, failCode, "FAILED test_queue.py::test_order")
 			return
 		}
 		shared.WriteOK(writer, map[string]any{"took_ms": 1})
@@ -163,7 +182,8 @@ func TestResubmittingSameRequestDoesNotDeployTwice(t *testing.T) {
 
 func TestResubmittingWhileRunningReturnsSameDeployment(t *testing.T) {
 	agent := newFakeAgent(t)
-	agent.hold = make(chan struct{})
+	hold := make(chan struct{})
+	agent.holds = map[string]chan struct{}{"/agent/ci": hold}
 	master := newTestMaster(t)
 	submit(master, "gh-6-1")
 	if recorder := submit(master, "gh-6-1"); recorder.Code != 202 || !strings.Contains(recorder.Body.String(), `"duplicate":true`) {
@@ -172,7 +192,7 @@ func TestResubmittingWhileRunningReturnsSameDeployment(t *testing.T) {
 	if recorder := submit(master, "gh-6-2"); recorder.Code != 409 || !strings.Contains(recorder.Body.String(), "deploy_in_progress") {
 		t.Fatalf("다른 요청은 진행 중 409여야 한다: %d %s", recorder.Code, recorder.Body.String())
 	}
-	close(agent.hold)
+	close(hold)
 	waitFinished(t, master, "gh-6-1")
 	if recorder := call(master, "GET", "/deploys/gh-6-2", ""); recorder.Code != 404 {
 		t.Fatalf("거절된 요청이 이력에 남았다: %d", recorder.Code)
@@ -222,8 +242,15 @@ func TestRestartClosesUnfinishedDeploymentsAndKeepsHistory(t *testing.T) {
 // failingStore — 정해 둔 상태를 기록하려 할 때 실패한다.
 type failingStore struct {
 	deploymentStore
+	mutex       sync.Mutex
 	failInsert  bool
 	failOnState string
+}
+
+func (store *failingStore) setFailOnState(state string) {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	store.failOnState = state
 }
 
 func (store *failingStore) Insert(deployment Deployment) error {
@@ -234,7 +261,10 @@ func (store *failingStore) Insert(deployment Deployment) error {
 }
 
 func (store *failingStore) Update(deployment Deployment) error {
-	if deployment.State == store.failOnState {
+	store.mutex.Lock()
+	failOnState := store.failOnState
+	store.mutex.Unlock()
+	if deployment.State == failOnState {
 		return errors.New("disk full")
 	}
 	return store.deploymentStore.Update(deployment)
@@ -284,5 +314,127 @@ func TestLookupRequiresSecretAndReportsMissing(t *testing.T) {
 	}
 	if recorder := call(master, "GET", "/deploys/gh-none", ""); recorder.Code != 404 {
 		t.Fatalf("없는 건은 404여야 한다: %d", recorder.Code)
+	}
+}
+
+func waitState(t *testing.T, master *Master, requestID, state string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if lookup(t, master, requestID).State == state {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%s 상태가 되지 않았다: %+v", state, lookup(t, master, requestID))
+}
+
+func TestStatePassesThroughEveryStage(t *testing.T) {
+	agent := newFakeAgent(t)
+	holdIntegration, holdDelivery := make(chan struct{}), make(chan struct{})
+	agent.holds = map[string]chan struct{}{"/agent/ci": holdIntegration, "/agent/cd": holdDelivery}
+	released := false
+	t.Cleanup(func() { // 중간에 실패해도 붙잡힌 요청을 풀어 준다 — 안 그러면 가짜 서버 종료가 멈춘다
+		if !released {
+			agent.mutex.Lock()
+			agent.holds = nil
+			agent.mutex.Unlock()
+			for _, hold := range []chan struct{}{holdIntegration, holdDelivery} {
+				select {
+				case <-hold:
+				default:
+					close(hold)
+				}
+			}
+		}
+	})
+	master := newTestMaster(t)
+	recorder := submit(master, "gh-11-1")
+	if !strings.Contains(recorder.Body.String(), `"state":"accepted"`) {
+		t.Fatalf("접수 응답의 상태는 accepted여야 한다: %s", recorder.Body.String())
+	}
+	waitState(t, master, "gh-11-1", StateIntegrating)
+	time.Sleep(50 * time.Millisecond) // CI가 붙잡혀 있는 동안에는 CD로 넘어가지 않는다
+	if calls := agent.called(); strings.Contains(calls, "/agent/cd") || lookup(t, master, "gh-11-1").State != StateIntegrating {
+		t.Fatalf("CI가 끝나기 전에 CD로 넘어갔다: %s", calls)
+	}
+	close(holdIntegration)
+	waitState(t, master, "gh-11-1", StateDelivering)
+	close(holdDelivery)
+	released = true
+	if deployment := waitFinished(t, master, "gh-11-1"); deployment.State != StateSucceeded {
+		t.Fatalf("성공으로 끝나야 한다: %+v", deployment)
+	}
+}
+
+func TestSuccessThatCannotBeRecordedIsReportedAsFailure(t *testing.T) {
+	newFakeAgent(t)
+	master := newTestMaster(t)
+	store := &failingStore{deploymentStore: master.store, failOnState: StateSucceeded}
+	master.store = store
+	submit(master, "gh-12-1")
+	deployment := waitFinished(t, master, "gh-12-1")
+	if deployment.State != StateFailed || deployment.FailedStage != StageStore || !strings.Contains(deployment.Detail, deploySha) {
+		t.Fatalf("기록하지 못한 성공은 store_failed로 드러나야 한다: %+v", deployment)
+	}
+}
+
+func TestFinishedResultIsServedFromMemoryUntilStoreRecovers(t *testing.T) {
+	agent := newFakeAgent(t)
+	agent.failPath, agent.failCode = "/agent/ci", "ci_test"
+	master := newTestMaster(t)
+	store := &failingStore{deploymentStore: master.store, failOnState: StateFailed}
+	master.store = store
+	submit(master, "gh-13-1")
+	deployment := waitFinished(t, master, "gh-13-1") // DB에는 ci_running으로 남아 있지만 조회는 실제 결과를 준다
+	if deployment.FailedStage != "ci_test" {
+		t.Fatalf("메모리에 보관한 결과가 아니다: %+v", deployment)
+	}
+	if recorded, _, _ := store.deploymentStore.Find("gh-13-1"); recorded.State != StateIntegrating {
+		t.Fatalf("테스트 전제 오류 — DB에 이미 기록됨: %+v", recorded)
+	}
+	store.setFailOnState("") // DB 복구
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if recorded, _, _ := store.deploymentStore.Find("gh-13-1"); recorded.State == StateFailed {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("DB가 복구됐는데 결과를 다시 기록하지 않았다")
+}
+
+func TestBusyAgentIsRetriedInsteadOfFailing(t *testing.T) {
+	agent := newFakeAgent(t)
+	agent.busyTimes = 2 // master 재시작 직후: agent가 앞선 작업을 아직 끝내지 못했다
+	master := newTestMaster(t)
+	submit(master, "gh-14-1")
+	if deployment := waitFinished(t, master, "gh-14-1"); deployment.State != StateSucceeded {
+		t.Fatalf("agent가 비면 진행돼야 한다: %+v", deployment)
+	}
+	if agent.called() != "/agent/ci,/agent/ci,/agent/ci,/agent/cd" {
+		t.Fatalf("재시도 순서가 다르다: %s", agent.called())
+	}
+}
+
+func TestAgentRefusalIsRecordedAsRejected(t *testing.T) {
+	agent := newFakeAgent(t)
+	agent.failPath, agent.failCode, agent.failStatus = "/agent/ci", "service_not_configured", 422
+	master := newTestMaster(t)
+	submit(master, "gh-15-1")
+	deployment := waitFinished(t, master, "gh-15-1")
+	if deployment.FailedStage != StageAgentRejected || !strings.Contains(deployment.Detail, "service_not_configured") {
+		t.Fatalf("agent의 거절은 agent_rejected + 사유여야 한다: %+v", deployment)
+	}
+}
+
+func TestOkStatusWithoutSuccessEnvelopeIsNotSuccess(t *testing.T) {
+	agent := newFakeAgent(t)
+	agent.rawBody = "<html>proxy</html>"
+	master := newTestMaster(t)
+	submit(master, "gh-16-1")
+	deployment := waitFinished(t, master, "gh-16-1")
+	if deployment.State != StateFailed || agent.called() != "/agent/ci" {
+		t.Fatalf("봉투 없는 200을 성공으로 쳤다: %+v calls=%s", deployment, agent.called())
 	}
 }

@@ -1,12 +1,13 @@
 package master
 
 import (
-	"os"
-	"path/filepath"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junhyeong9812/study-note-deploy-system-ci-cd/internal/shared"
 )
@@ -21,6 +22,7 @@ func newTestMaster(t *testing.T) *Master {
 	if err != nil {
 		t.Fatal(err)
 	}
+	master.busyRetryInterval, master.storeRetryInterval = 5*time.Millisecond, 20*time.Millisecond
 	return master
 }
 

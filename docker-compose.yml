@@ -8,6 +8,8 @@ services:
     container_name: ci-cd-master
     network_mode: host
     env_file: .env.master
+    environment:
+      DEPLOY_DB_PATH: /data/deploys.db                 # 아래 볼륨과 짝 — 작업 디렉토리에 기대지 않는다
     volumes:
       - ./data:/data                                   # 배포 이력 DB(SQLite) — 재시작해도 남는다
     healthcheck:
