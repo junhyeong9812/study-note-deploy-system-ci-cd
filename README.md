@@ -71,4 +71,6 @@ cp deploy/nginx/upstream-green.conf deploy/active/upstream.conf && docker compos
 docker compose stop <기준>-blue                                    # 남은 연결이 끝난 뒤(최대 3분)
 ```
 - 이름 없이 `docker compose up -d` 를 해도 두 자리는 뜨지 않는다(자리에는 profiles 가 붙어 있다).
+- 정리 알림(`DEPLOY_DRAIN_*`)을 받은 앱은 새 일을 받지 않는다(llm 래퍼는 질문을 돌려보낸다). 그 자리를 손으로 다시 활성 자리로 돌릴 때는 컨테이너를 재기동한다: `docker compose restart <기준>-<자리>`.
+- 구 자리는 전환 뒤 reload 가 자리 잡기를 2초 기다린 다음, 남은 연결이 끝나면(최대 3분) 내려간다. 로그에 `자리 정지 보류` 가 남았으면 두 자리가 떠 있는 것이다 — 아래처럼 응답 자리를 확인하고 반대쪽을 내린다.
 - 배포가 `cd_switch` + "되돌림 미확인"/"활성 파일 복원 실패"로 끝났으면 두 자리가 모두 떠 있을 수 있다. 위 명령으로 응답 자리를 확인하고 반대쪽을 내린다. 다음 배포도 실제 응답 자리를 기준으로 정리한다.
