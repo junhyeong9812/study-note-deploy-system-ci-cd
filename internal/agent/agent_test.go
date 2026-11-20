@@ -12,13 +12,14 @@ import (
 func newTestAgent(t *testing.T) *Agent {
 	t.Setenv("DEPLOY_SECRET", "test-value")
 	t.Setenv("DEPLOY_DIR_LLM", t.TempDir())
+	t.Setenv("DEPLOY_SVC_LLM", "wrapper")
 	return New(shared.NewLogger())
 }
 
 func request(agent *Agent, body string) *httptest.ResponseRecorder {
 	mux := http.NewServeMux()
 	agent.Register(mux)
-	req := httptest.NewRequest("POST", "/agent/deploy", strings.NewReader(body))
+	req := httptest.NewRequest("POST", "/agent/ci", strings.NewReader(body))
 	req.Header.Set(shared.SecretHeader, "test-value")
 	recorder := httptest.NewRecorder()
 	mux.ServeHTTP(recorder, req)

@@ -2,14 +2,12 @@
 package agent
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -92,7 +90,6 @@ func New(logger *shared.Logger) *Agent {
 }
 
 func (agent *Agent) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /agent/deploy", agent.handleDeploy) // 구 경로 — master 전환 뒤 제거
 	mux.HandleFunc("POST /agent/ci", agent.handleStage("ci", agent.integrate))
 	mux.HandleFunc("POST /agent/cd", agent.handleStage("cd", agent.deliver))
 }
@@ -150,92 +147,4 @@ func (agent *Agent) handleStage(name string, execute func(service, commitSha str
 		agent.logger.Log(requestID, fmt.Sprintf("agent %s ok %s sha=%s %dms", name, payload.Service, payload.CommitSha, tookMs), "info")
 		shared.WriteOK(writer, map[string]any{"took_ms": tookMs, "output": tail(output, outputTailLimit)})
 	}
-}
-
-func (agent *Agent) handleDeploy(writer http.ResponseWriter, request *http.Request) {
-	if !shared.SecretMatches(request, agent.secret) {
-		shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")
-		return
-	}
-	body, _ := io.ReadAll(io.LimitReader(request.Body, 4096))
-	var payload struct {
-		Service   string `json:"service"`
-		CommitSha string `json:"commit_sha"`
-		RequestID string `json:"request_id"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_request", "bad json")
-		return
-	}
-	requestID := shared.AcceptOrIssue(payload.RequestID)
-	directory, allowed := agent.directories[payload.Service]
-	if !allowed {
-		shared.WriteFail(writer, http.StatusUnprocessableEntity, "unknown_service", payload.Service)
-		return
-	}
-	if !shared.ValidCommitSha(payload.CommitSha) {
-		shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_sha", "")
-		return
-	}
-	if !agent.busy.TryLock() {
-		shared.WriteFail(writer, http.StatusConflict, "deploy_in_progress", "")
-		return
-	}
-	defer agent.busy.Unlock()
-
-	startedAt := time.Now()
-	agent.logger.Log(requestID, fmt.Sprintf("agent deploy start %s sha=%s", payload.Service, payload.CommitSha), "info")
-	composeService := agent.composeServices[payload.Service] // ""이면 전체 (비권장 — env로 지정)
-	output, err := agent.composeDeploy(directory, payload.CommitSha, composeService)
-	tookMs := time.Since(startedAt).Milliseconds()
-	if err != nil {
-		agent.logger.Log(requestID, fmt.Sprintf("agent deploy failed %s: %s", payload.Service, truncate(output, 200)), "error")
-		shared.WriteFail(writer, http.StatusInternalServerError, "deploy_failed", truncate(output, 500))
-		return
-	}
-	if healthURL := agent.healthURLs[payload.Service]; healthURL != "" {
-		if err := waitHealthy(healthURL, 90*time.Second); err != nil { // compose 성공 ≠ 서비스 정상 (F7)
-			agent.logger.Log(requestID, fmt.Sprintf("agent deploy unhealthy %s: %s", payload.Service, err), "error")
-			shared.WriteFail(writer, http.StatusInternalServerError, "deploy_unhealthy", err.Error())
-			return
-		}
-	}
-	agent.logger.Log(requestID, fmt.Sprintf("agent deploy ok %s sha=%s %dms", payload.Service, payload.CommitSha, tookMs), "info")
-	shared.WriteOK(writer, map[string]any{"took_ms": tookMs, "output": truncate(output, 500)})
-}
-
-// composeDeploy — git pull + 호스트 재빌드 (사용자 결정 2026-08-29: 전달 채널 = git 하나).
-// 순서: ① fetch(요청 sha 포함되도록 depth 50) ② reset --hard <sha> — 정확히 그 커밋 배포
-//
-//	③ compose up -d --build <대상 서비스만> (무관 서비스 재생성 차단)
-func (agent *Agent) composeDeploy(directory, commitSha, composeService string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute) // 호스트 빌드 여유(backend gradle 수 분)
-	defer cancel()
-	commands := [][]string{
-		{"git", "-C", directory, "fetch", "--depth=50", "origin", "main"},
-		{"git", "-C", directory, "reset", "--hard", commitSha},
-	}
-	upArguments := []string{"docker", "compose", "up", "-d", "--build"}
-	if composeService != "" {
-		upArguments = append(upArguments, composeService)
-	}
-	commands = append(commands, upArguments)
-	var combined strings.Builder
-	for _, arguments := range commands {
-		command := exec.CommandContext(ctx, arguments[0], arguments[1:]...)
-		command.Dir = directory
-		output, err := command.CombinedOutput()
-		combined.Write(output)
-		if err != nil {
-			return combined.String(), err
-		}
-	}
-	return combined.String(), nil
-}
-
-func truncate(input string, limit int) string {
-	if len(input) <= limit {
-		return input
-	}
-	return input[:limit]
 }
