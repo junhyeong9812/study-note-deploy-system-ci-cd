@@ -26,7 +26,11 @@ const (
 	slotMarkerPrefix = "# slot: "
 	proxyService     = "nginx"
 	activeFile       = "deploy/active/upstream.conf"
-	templatePattern  = "deploy/nginx/upstream-%s.conf"
+	// nginx 본 설정: repo의 원본을 전환할 때 git 밖(활성 디렉토리)으로 복사해 그 사본을 nginx가 읽는다.
+	// nginx가 git 작업 트리를 직접 읽으면 CI의 reset만으로 운영 설정이 바뀌고, 전환 실패 때 되돌릴 수 없다.
+	proxyConfigSource = "deploy/nginx/nginx.conf"
+	proxyConfigActive = "deploy/active/nginx.conf"
+	templatePattern   = "deploy/nginx/upstream-%s.conf"
 
 	switchBudget = 30 * time.Second // nginx 검사·reload
 )
@@ -67,7 +71,10 @@ func readSlotTemplate(directory, slot string) (string, error) {
 
 // writeActiveFile — 임시 파일에 쓴 뒤 이름을 바꿔 한 번에 교체한다(nginx가 반쯤 쓰인 파일을 읽지 않게).
 func writeActiveFile(directory, content string) error {
-	path := filepath.Join(directory, activeFile)
+	return writeFileAtomically(filepath.Join(directory, activeFile), content)
+}
+
+func writeFileAtomically(path, content string) error {
 	temporary := path + ".tmp"
 	if err := os.WriteFile(temporary, []byte(content), 0o644); err != nil {
 		return err
@@ -185,10 +192,33 @@ func (agent *Agent) deliverBlueGreen(service, commitSha string) (string, error) 
 			combined.WriteString(fmt.Sprintf("\n되돌림 실패(%s): %s %v\n", description, tail(output, 300), err))
 		}
 	}
+	// nginx 본 설정의 운영 사본. 새 커밋의 원본으로 바꾸기 전 내용을 보관해 두고, 실패하면 활성 파일과 함께 되돌린다.
+	proxyConfigPath := filepath.Join(directory, proxyConfigActive)
+	previousProxyConfig, previousProxyConfigErr := os.ReadFile(proxyConfigPath)
+	proxyConfigChanged := false
+	applyProxyConfig := func() error {
+		source, err := os.ReadFile(filepath.Join(directory, proxyConfigSource))
+		if err != nil {
+			if os.IsNotExist(err) { // repo가 본 설정을 두지 않는 구성 — 운영 사본을 그대로 쓴다
+				agent.logger.Log("cd", service+" nginx 본 설정 원본이 없어 운영 사본을 유지", "warning")
+				return nil
+			}
+			return err
+		}
+		if previousProxyConfigErr == nil && string(previousProxyConfig) == string(source) {
+			return nil
+		}
+		proxyConfigChanged = true
+		return writeFileAtomically(proxyConfigPath, string(source))
+	}
 	// 활성 파일을 이전 내용으로 되돌린다. 실패하면 파일이 대상 자리를 가리킨 채 남는다 —
 	// 그 상태에서 대상 자리를 내리면 nginx가 다시 뜰 때 갈 곳이 없으므로, 호출한 쪽은 대상 자리를 내리지 않는다.
 	restoreActiveFile := func() bool {
-		if err := writeActiveFile(directory, previousContent); err != nil {
+		err := writeActiveFile(directory, previousContent)
+		if err == nil && proxyConfigChanged && previousProxyConfigErr == nil {
+			err = writeFileAtomically(proxyConfigPath, string(previousProxyConfig))
+		}
+		if err != nil {
 			combined.WriteString("\n되돌림 실패(활성 파일 복원) — 대상 자리를 내리지 않고 둔다(서버에서 확인 필요): " + err.Error() + "\n")
 			agent.logger.Log("cd", fmt.Sprintf("%s 활성 파일 복원 실패 — 두 자리 유지: %v", service, err), "error")
 			return false
@@ -215,6 +245,9 @@ func (agent *Agent) deliverBlueGreen(service, commitSha string) (string, error) 
 	// 5~6. 활성 파일 교체 → 설정 검사. 여기까지는 nginx가 아직 구 자리로 보낸다.
 	template, err := readSlotTemplate(directory, targetSlot)
 	if err == nil {
+		err = applyProxyConfig()
+	}
+	if err == nil {
 		err = writeActiveFile(directory, template)
 	}
 	if err != nil {
@@ -240,7 +273,7 @@ func (agent *Agent) deliverBlueGreen(service, commitSha string) (string, error) 
 		}
 		// 구 자리로 돌아온 것을 확인한 뒤에만 대상 자리를 정리한다. 확인하지 못하면 nginx가 대상 자리로
 		// 보내고 있을 수 있다 — 어느 자리도 내리지 않고 사람이 보게 남긴다.
-		if err := agent.waitSlot(publicURL, activeSlot); err != nil {
+		if err := agent.waitServingSlot(publicURL, activeSlot); err != nil {
 			combined.WriteString("\n되돌림 미확인 — 두 자리를 모두 그대로 둔다(서버에서 확인 필요): " + err.Error() + "\n")
 			agent.logger.Log("cd", fmt.Sprintf("%s 되돌림 미확인 — 두 자리 유지: %v", service, err), "error")
 			return fail(StageSwitch)
@@ -272,6 +305,22 @@ func (agent *Agent) waitSlot(publicURL, wantedSlot string) error {
 		}
 		if !time.Now().Before(deadline) {
 			return fmt.Errorf("전환 미확인: 원하는 자리 %s, 응답한 자리 %q, 오류 %v", wantedSlot, lastSlot, lastError)
+		}
+		time.Sleep(agent.probeInterval)
+	}
+}
+
+// waitServingSlot — nginx가 지정한 자리로 보내는 것을 표식만으로 확인한다(되돌림 확인용).
+// 구 자리의 앱이 죽어 502가 나오는 상황에서도 "구 자리로 돌아왔다"는 판정은 할 수 있어야 한다.
+func (agent *Agent) waitServingSlot(publicURL, wantedSlot string) error {
+	deadline := time.Now().Add(agent.probeBudget)
+	for {
+		slot, err := agent.servingSlot(publicURL)
+		if err == nil && slot == wantedSlot {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("자리 미확인: 원하는 자리 %s, 응답한 자리 %q, 오류 %v", wantedSlot, slot, err)
 		}
 		time.Sleep(agent.probeInterval)
 	}
@@ -399,7 +448,9 @@ func (agent *Agent) reconcileSlot(service string) bool {
 	if agent.modes[service] != modeBlueGreen {
 		return true
 	}
-	agent.busy.Lock()
+	if !agent.busy.TryLock() { // 배포가 진행 중이면 끼어들지 않고 다음 회차에 본다
+		return false
+	}
 	defer agent.busy.Unlock()
 	activeSlot, err := agent.servingSlot(agent.healthURLs[service])
 	if err != nil {

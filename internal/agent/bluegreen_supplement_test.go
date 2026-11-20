@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -311,7 +313,7 @@ func TestReconcileDoesNotStopWhenActiveFileCannotBeAligned(t *testing.T) {
 	slotRequireActiveContent(t, world, slotGreenTemplate, "맞추지 못한 경우")
 }
 
-func TestReconcileWaitsForDeliveryInProgress(t *testing.T) {
+func TestReconcileStaysOutOfDeliveryInProgress(t *testing.T) {
 	// CD가 대상 자리(green)를 띄우는 동안 기동 시 정리가 그 자리를 정리 대상으로 삼으면 안 된다
 	agent, world := slotNewAgent(t, slotSetup{activeContent: slotBlueTemplate, servingSlot: "blue"})
 	started, release := make(chan struct{}), make(chan struct{})
@@ -324,21 +326,15 @@ func TestReconcileWaitsForDeliveryInProgress(t *testing.T) {
 	delivered := make(chan int, 1)
 	go func() { delivered <- slotPost(agent, supplementCommit).Code }()
 	<-started
-	reconciled := make(chan struct{})
-	go func() { agent.ReconcileSlots(); close(reconciled) }()
-	select {
-	case <-reconciled:
-		t.Fatal("CD가 진행 중인데 기동 시 정리가 끼어들었다")
-	case <-time.After(100 * time.Millisecond):
-	}
-	if supplementStopped(world, "green") && slotCount(world.snapshot(), "run", "stop wrapper-green") > 1 {
-		t.Fatalf("CD가 띄운 대상 자리를 정리가 내렸다:\n%s", slotDescribe(world.snapshot()))
+	agent.ReconcileSlots() // 배포 중에는 아무것도 하지 않고 돌아온다
+	slotWaitBackground(t, agent)
+	if slotCount(world.snapshot(), "notify", "") != 0 || slotCount(world.snapshot(), "run", "stop wrapper-green") != 1 {
+		t.Fatalf("배포 중인데 기동 시 정리가 끼어들었다(대상 자리 정지는 2단계의 1회뿐이어야 한다):\n%s", slotDescribe(world.snapshot()))
 	}
 	close(release)
 	if code := <-delivered; code != 200 {
 		t.Fatalf("CD는 성공해야 한다: %d", code)
 	}
-	<-reconciled
 	slotWaitBackground(t, agent)
 	events := world.snapshot()
 	if last := slotFind(events, "run", "up -d", 0); last < 0 || slotFind(events, "run", "stop wrapper-green", last) >= 0 {
@@ -346,49 +342,88 @@ func TestReconcileWaitsForDeliveryInProgress(t *testing.T) {
 	}
 }
 
-func TestDeliveryProceedsWhenActiveAppIsDownButProxyAnswers(t *testing.T) {
-	// 운영 중인 앱이 죽어 nginx가 502를 낸다. 표식으로 자리는 알 수 있으므로 고치는 배포가 진행돼야 한다.
+func TestRevertIsConfirmedByMarkerEvenWhenOldSlotIsDown(t *testing.T) {
+	// 고치는 배포: 구 자리(blue)는 죽어 502 + 표식 blue. 8단계에서 새 자리가 응답하지 않아 되돌린다.
+	// "blue로 돌아왔다"는 표식만으로 확인되므로 새 자리(green)는 정리로 넘어가야 한다(두 벌 방치 금지).
 	agent, world := slotNewAgent(t, slotSetup{activeContent: slotBlueTemplate, servingSlot: "blue"})
+	world.mutex.Lock()
+	world.reloadIgnored = true // reload가 적용되지 않는다 → 8단계 실패
+	world.mutex.Unlock()
 	agent.probeSlot = func(healthURL string) (string, error) {
 		slot, err := world.probe(healthURL)
 		if err == nil && slot == "blue" {
-			return slot, errors.New("status 502") // blue는 죽어 있다
+			return slot, errors.New("status 502")
 		}
 		return slot, err
 	}
-	if recorder := slotPost(agent, supplementCommit); recorder.Code != 200 {
-		t.Fatalf("죽은 자리에서 새 자리로 전환돼야 한다: %d %s", recorder.Code, recorder.Body.String())
-	}
-	slotWaitBackground(t, agent)
-	slotRequireActiveContent(t, world, slotGreenTemplate, "고치는 배포 뒤")
-}
-
-func TestTargetSlotIsKeptWhenActiveFileCannotBeRestored(t *testing.T) {
-	// nginx 설정 검사가 실패했는데 활성 파일 복원도 실패한다: 파일은 대상 자리(green)를 가리킨 채 남는다.
-	// 그 상태에서 green을 내리면 nginx가 다시 뜰 때 갈 곳이 없다.
-	agent, world := slotNewAgent(t, slotSetup{activeContent: slotBlueTemplate, servingSlot: "blue"})
-	activeDirectory := filepath.Join(agent.directories["llm"], "deploy", "active")
-	agent.run = func(ctx context.Context, directory string, environment []string, arguments ...string) (string, error) {
-		line := strings.Join(arguments, " ")
-		if strings.HasSuffix(line, "nginx -t") {
-			// 복원이 실패하도록 활성 디렉토리를 쓸 수 없는 것으로 바꾼다(디렉토리 자리에 일반 파일)
-			_ = os.RemoveAll(activeDirectory)
-			_ = os.WriteFile(activeDirectory, []byte("not a directory"), 0o644)
-			world.mutex.Lock()
-			world.events = append(world.events, slotEvent{kind: "run", text: line})
-			world.mutex.Unlock()
-			return "nginx: configuration file test failed", errors.New("exit status 1")
-		}
-		return world.run(ctx, directory, environment, arguments...)
-	}
 	recorder := slotPost(agent, supplementCommit)
 	slotRequireFailure(t, recorder, "cd_switch")
-	if !strings.Contains(recorder.Body.String(), "활성 파일 복원") {
-		t.Fatalf("복원 실패가 응답에 드러나지 않는다: %s", recorder.Body.String())
+	if strings.Contains(recorder.Body.String(), "되돌림 미확인") {
+		t.Fatalf("표식으로 복귀가 확인되는데 미확인으로 보고했다: %s", recorder.Body.String())
 	}
 	slotWaitBackground(t, agent)
 	events := world.snapshot()
-	if started := slotFind(events, "run", "up -d", 0); started < 0 || slotFind(events, "run", "stop wrapper-green", started) >= 0 {
-		t.Fatalf("활성 파일이 가리킬 수 있는 대상 자리를 내렸다:\n%s", slotDescribe(events))
+	if started := slotFind(events, "run", "up -d", 0); started < 0 || slotFind(events, "run", "stop wrapper-green", started) < 0 {
+		t.Fatalf("되돌린 뒤 새 자리를 정리하지 않았다:\n%s", slotDescribe(events))
+	}
+}
+
+func TestProxyConfigIsCopiedOnSwitchAndRestoredOnFailure(t *testing.T) {
+	agent, world := slotNewAgent(t, slotSetup{activeContent: slotBlueTemplate, servingSlot: "blue"})
+	directory := agent.directories["llm"]
+	source := filepath.Join(directory, "deploy", "nginx", "nginx.conf")
+	active := filepath.Join(directory, "deploy", "active", "nginx.conf")
+	write := func(path, content string) {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(path string) string {
+		content, _ := os.ReadFile(path)
+		return string(content)
+	}
+	write(active, "# 운영 중인 설정\n")
+	write(source, "# 새 커밋의 설정\n")
+
+	world.setFailure("nginx -t", 1) // 새 설정이 검사에 실패
+	slotRequireFailure(t, slotPost(agent, supplementCommit), "cd_switch")
+	slotWaitBackground(t, agent)
+	if read(active) != "# 운영 중인 설정\n" {
+		t.Fatalf("설정 검사에 실패했는데 nginx 본 설정이 이전 내용으로 돌아오지 않았다: %q", read(active))
+	}
+
+	if recorder := slotPost(agent, supplementCommit); recorder.Code != 200 {
+		t.Fatalf("두 번째 배포는 성공해야 한다: %d %s", recorder.Code, recorder.Body.String())
+	}
+	slotWaitBackground(t, agent)
+	if read(active) != "# 새 커밋의 설정\n" {
+		t.Fatalf("전환에 성공했는데 nginx 본 설정이 새 내용으로 바뀌지 않았다: %q", read(active))
+	}
+}
+
+func TestProbeSlotReturnsMarkerEvenWhenStatusIsNotOk(t *testing.T) {
+	respond := func(status int, slot string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			if slot != "" {
+				writer.Header().Set("X-Deploy-Slot", slot)
+			}
+			writer.WriteHeader(status)
+		}))
+	}
+	healthy, down, unmarked := respond(200, "green"), respond(502, "blue"), respond(200, "")
+	defer healthy.Close()
+	defer down.Close()
+	defer unmarked.Close()
+	if slot, err := probeSlot(healthy.URL); slot != "green" || err != nil {
+		t.Fatalf("200 + 표식: %q %v", slot, err)
+	}
+	if slot, err := probeSlot(down.URL); slot != "blue" || err == nil {
+		t.Fatalf("502여도 표식은 돌려주고 오류도 알려야 한다: %q %v", slot, err)
+	}
+	if slot, err := probeSlot(unmarked.URL); slot != "" || err != nil {
+		t.Fatalf("표식 없음: %q %v", slot, err)
+	}
+	if _, err := probeSlot("http://127.0.0.1:1/"); err == nil {
+		t.Fatal("응답 없음은 오류여야 한다")
 	}
 }
