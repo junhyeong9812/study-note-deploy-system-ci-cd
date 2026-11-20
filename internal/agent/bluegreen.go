@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -71,6 +72,12 @@ func writeActiveFile(directory, content string) error {
 	temporary := path + ".tmp"
 	if err := os.WriteFile(temporary, []byte(content), 0o644); err != nil {
 		return err
+	}
+	// agent는 컨테이너 안에서 root로 돈다 — 원래 소유자를 유지해 서버에서 손으로 고칠 수 있게 둔다(실패해도 전환과 무관)
+	if existing, err := os.Stat(path); err == nil {
+		if owner, ok := existing.Sys().(*syscall.Stat_t); ok {
+			_ = os.Chown(temporary, int(owner.Uid), int(owner.Gid))
+		}
 	}
 	return os.Rename(temporary, path)
 }
