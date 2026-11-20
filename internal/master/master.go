@@ -79,6 +79,10 @@ func New(logger *shared.Logger) (*Master, error) {
 	}
 	if closed > 0 {
 		logger.Log("boot", fmt.Sprintf("미완료 배포 %d건을 failed(interrupted)로 닫음", closed), "warning")
+		// 이것도 failed 로 끝난 배포다 — 건마다가 아니라 한 번에 알린다
+		master.alerts.Send("boot", "deploy_failed", "warning", "deploy-interrupted",
+			fmt.Sprintf("배포 %d건이 master 재시작으로 중단됨", closed),
+			"진행 중이던 배포를 failed(interrupted)로 닫았다. 해당 실행을 GitHub 에서 다시 돌려야 한다.")
 	}
 	return master, nil
 }

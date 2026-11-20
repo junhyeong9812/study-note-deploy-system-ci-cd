@@ -518,3 +518,43 @@ func TestUnreachableAlertServerDoesNotChangeDeploymentResult(t *testing.T) {
 		t.Fatalf("알림을 못 보냈다고 배포 결과가 바뀌었다: %+v", deployment)
 	}
 }
+
+func TestRestartReportsInterruptedDeploymentsOnce(t *testing.T) {
+	events := make(chan map[string]string, 4)
+	alertServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var event map[string]string
+		json.NewDecoder(request.Body).Decode(&event)
+		events <- event
+		writer.WriteHeader(http.StatusAccepted)
+	}))
+	defer alertServer.Close()
+	path := filepath.Join(t.TempDir(), "deploys.db")
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Insert(Deployment{RequestID: "gh-30-1", Service: "llm", CommitSha: deploySha, State: StateDelivering, AcceptedAt: "2026-11-19T11:00:00Z"})
+	store.Insert(Deployment{RequestID: "gh-30-2", Service: "front", CommitSha: deploySha, State: StateAccepted, AcceptedAt: "2026-11-19T11:01:00Z"})
+	store.database.Close()
+
+	t.Setenv("DEPLOY_SECRET", "test-value")
+	t.Setenv("AGENT_URL_LLM", "http://127.0.0.1:1")
+	t.Setenv("DEPLOY_DB_PATH", path)
+	t.Setenv("ALERT_EVENTS_URL", alertServer.URL)
+	if _, err := New(shared.NewLogger()); err != nil { // 재시작
+		t.Fatal(err)
+	}
+	select {
+	case event := <-events:
+		if event["kind"] != "deploy_failed" || !strings.Contains(event["title"], "2건") {
+			t.Fatalf("중단된 배포를 알리는 내용이 다르다: %v", event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("재시작으로 중단된 배포를 알리지 않았다")
+	}
+	select {
+	case extra := <-events:
+		t.Fatalf("건마다 따로 알렸다: %v", extra)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
