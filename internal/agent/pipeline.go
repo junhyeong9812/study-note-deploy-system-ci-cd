@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -25,7 +26,7 @@ const (
 
 const (
 	continuousIntegrationBudget = 10 * time.Minute // 테스트 + 이미지 빌드 (backend gradle 수 분)
-	continuousDeliveryBudget    = 2 * time.Minute  // 이미지 교체만 — 빌드는 CI에서 끝났다
+	continuousDeliveryBudget    = 4 * time.Minute  // 기동 2분 + 자리 헬스 90초 + 전환 30초 — 빌드는 CI에서 끝났다
 	healthBudget                = 90 * time.Second
 	retainBudget                = time.Minute // 이미지 정리 — 교체·헬스가 쓴 시간과 별개
 	keptImageTags               = 5           // 되돌리기용으로 남기는 sha 이미지 수 (디스크 상한)
@@ -102,7 +103,7 @@ func (agent *Agent) integrate(service, commitSha string) (string, error) {
 	if err := step(StageTest, "docker", "build", "--target", "test", agent.testContext(service)); err != nil {
 		return restore(err)
 	}
-	if err := step(StageBuild, "docker", "compose", "build", agent.composeServices[service]); err != nil {
+	if err := step(StageBuild, "docker", "compose", "build", agent.buildService(service)); err != nil {
 		return restore(err)
 	}
 	return combined.String(), nil
@@ -115,9 +116,39 @@ func (agent *Agent) testContext(service string) string {
 	return "."
 }
 
+// buildService — 이미지를 빌드할 compose 서비스. 두 자리는 같은 이미지를 쓰므로 한쪽만 빌드하면 된다.
+func (agent *Agent) buildService(service string) string {
+	if agent.modes[service] == modeBlueGreen {
+		return agent.slotService(service, slotBlue)
+	}
+	return agent.composeServices[service]
+}
+
+// runningService — 지금 운영 중인 compose 서비스. 두 자리 방식이면 nginx가 실제로 보내는 자리(응답 기준).
+// 외부 포트가 응답하지 않으면(서비스가 죽어 있어 고치는 배포일 수 있다) 활성 파일의 표식을 차선으로 쓴다.
+func (agent *Agent) runningService(directory, service string) string {
+	if agent.modes[service] != modeBlueGreen {
+		return agent.composeServices[service]
+	}
+	slot, err := agent.servingSlot(agent.healthURLs[service])
+	if err != nil {
+		content, readErr := os.ReadFile(filepath.Join(directory, activeFile))
+		if readErr != nil || markedSlot(string(content)) == "" {
+			return ""
+		}
+		slot = markedSlot(string(content))
+		agent.logger.Log("ci", fmt.Sprintf("%s 실제 자리 확인 불가(%v) — 활성 파일의 자리 %s 를 기준으로 삼음", service, err, slot), "warning")
+	}
+	return agent.slotService(service, slot)
+}
+
 // runningImage — 지금 실행 중인 대상 컨테이너의 이미지 이름과 태그. 알 수 없으면 빈 문자열.
 func (agent *Agent) runningImage(ctx context.Context, directory, service string) (name, tag string) {
-	containerIDs, err := agent.run(ctx, directory, nil, "docker", "compose", "ps", "-q", agent.composeServices[service])
+	runningService := agent.runningService(directory, service)
+	if runningService == "" {
+		return "", ""
+	}
+	containerIDs, err := agent.run(ctx, directory, nil, "docker", "compose", "ps", "-q", runningService)
 	containerID, _, _ := strings.Cut(strings.TrimSpace(containerIDs), "\n")
 	if err != nil || containerID == "" {
 		return "", ""
@@ -136,6 +167,9 @@ func (agent *Agent) runningImage(ctx context.Context, directory, service string)
 
 // deliver — CD: CI가 만든 sha 이미지로 대상 컨테이너만 교체. 빌드하지 않고 의존 서비스도 건드리지 않는다.
 func (agent *Agent) deliver(service, commitSha string) (string, error) {
+	if agent.modes[service] == modeBlueGreen {
+		return agent.deliverBlueGreen(service, commitSha)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), continuousDeliveryBudget)
 	defer cancel()
 	directory := agent.directories[service]
