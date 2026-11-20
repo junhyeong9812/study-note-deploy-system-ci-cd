@@ -42,6 +42,13 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 - 구동: `.env` 작성 후 `docker compose up -d --build` · 테스트: `go test ./...`
 
 
+## 알림 서버 연동
+
+`ALERT_EVENTS_URL`·`ALERT_SECRET` 이 설정돼 있으면 사람이 알아야 할 일을 알림 서버에 보낸다. 보내는 일은 배포와 분리돼 있어 실패해도 배포 결과를 바꾸지 않는다.
+
+- master: 배포가 `failed` 로 끝났을 때(서비스·단계·출력 끝부분)
+- agent: 두 자리가 남았을 수 있을 때 — 자리 정지 보류, 되돌림 미확인, 활성 파일 복원 실패
+
 ## 무중단 배포(blue/green) — 서비스별로 켠다
 
 `DEPLOY_MODE_<SVC>=bluegreen` 인 서비스는 앱을 두 자리(`<기준>-blue`·`<기준>-green`)로 두고 nginx 가 그중 하나로 보낸다. 켜지 않은 서비스는 위의 단일 컨테이너 방식 그대로다.
