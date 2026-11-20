@@ -31,7 +31,9 @@ func main() {
 		deployMaster.Register(mux)
 		defaultPort = "15000"
 	case "agent":
-		agent.New(logger).Register(mux)
+		deployAgent := agent.New(logger)
+		deployAgent.Register(mux)
+		deployAgent.ReconcileSlots() // 지난 실행이 두 벌을 남겼으면 실제 활성 자리의 반대쪽을 정리한다
 		defaultPort = "15001"
 	default:
 		fmt.Fprintln(os.Stderr, "MODE must be master or agent") // fail-closed: 모드 없이 뜨지 않는다
@@ -42,7 +44,7 @@ func main() {
 		port = defaultPort
 	}
 	logger.Log("boot", "listening :"+port+" mode="+mode, "info")
-	server := &http.Server{                       // 자원 보호 타임아웃 (리뷰 F9)
+	server := &http.Server{ // 자원 보호 타임아웃 (리뷰 F9)
 		Addr:              ":" + port,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,

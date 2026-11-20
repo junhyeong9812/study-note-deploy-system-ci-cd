@@ -28,9 +28,25 @@ type Agent struct {
 	healthURLs map[string]string
 	// 서비스 → 테스트 빌드 경로(배포 디렉토리 기준). env DEPLOY_TEST_CONTEXT_<SVC> — 없으면 "."
 	testContexts map[string]string
-	busy        sync.Mutex // 한 번에 하나의 작업만 (호스트 자원 보호)
-	run         commandRunner
-	waitHealthy func(healthURL string, budget time.Duration) error
+	// 서비스 → 전환 방식. env DEPLOY_MODE_<SVC>=bluegreen 이면 두 자리 + nginx 전환, 아니면 단일 컨테이너 교체
+	modes map[string]string
+	// 서비스 → 자리 → 헬스 URL(127.0.0.1 포트). env DEPLOY_HEALTH_<SVC>_BLUE·_GREEN
+	slotHealthURLs map[string]map[string]string
+	// 서비스 → 자리 → 정리 시작 알림 URL(선택). env DEPLOY_DRAIN_<SVC>_BLUE·_GREEN
+	slotDrainURLs map[string]map[string]string
+	busy          sync.Mutex // 한 번에 하나의 작업만 (호스트 자원 보호)
+	run           commandRunner
+	waitHealthy   func(healthURL string, budget time.Duration) error
+	probeSlot     func(healthURL string) (slot string, err error)
+	notifyDrain   func(drainURL string) error
+
+	probeInterval     time.Duration
+	probeBudget       time.Duration
+	drainPollInterval time.Duration
+	drainLimit        time.Duration // 구 버전에 남은 연결을 기다리는 상한
+	drainMutex        sync.Mutex
+	draining          map[string]chan struct{} // 서비스 → 진행 중인 정리(끝나면 닫힌다)
+	background        sync.WaitGroup
 }
 
 func New(logger *shared.Logger) *Agent {
@@ -38,6 +54,9 @@ func New(logger *shared.Logger) *Agent {
 	composeServices := map[string]string{}
 	healthURLs := map[string]string{}
 	testContexts := map[string]string{}
+	modes := map[string]string{}
+	slotHealthURLs := map[string]map[string]string{}
+	slotDrainURLs := map[string]map[string]string{}
 	for _, service := range []string{"front", "backend", "llm"} {
 		if directory := os.Getenv("DEPLOY_DIR_" + strings.ToUpper(service)); directory != "" {
 			directories[service] = directory
@@ -51,10 +70,23 @@ func New(logger *shared.Logger) *Agent {
 		if testContext := os.Getenv("DEPLOY_TEST_CONTEXT_" + strings.ToUpper(service)); testContext != "" {
 			testContexts[service] = testContext
 		}
+		modes[service] = os.Getenv("DEPLOY_MODE_" + strings.ToUpper(service))
+		slotHealthURLs[service] = map[string]string{}
+		slotDrainURLs[service] = map[string]string{}
+		for _, slot := range []string{slotBlue, slotGreen} {
+			suffix := strings.ToUpper(service) + "_" + strings.ToUpper(slot)
+			slotHealthURLs[service][slot] = os.Getenv("DEPLOY_HEALTH_" + suffix)
+			slotDrainURLs[service][slot] = os.Getenv("DEPLOY_DRAIN_" + suffix)
+		}
 	}
 	return &Agent{secret: os.Getenv("DEPLOY_SECRET"), logger: logger,
 		directories: directories, composeServices: composeServices, healthURLs: healthURLs,
-		testContexts: testContexts, run: runCommand, waitHealthy: waitHealthy}
+		testContexts: testContexts, run: runCommand, waitHealthy: waitHealthy,
+		modes: modes, slotHealthURLs: slotHealthURLs, slotDrainURLs: slotDrainURLs,
+		probeSlot: probeSlot, notifyDrain: notifyDrain,
+		probeInterval: time.Second, probeBudget: 30 * time.Second,
+		drainPollInterval: 2 * time.Second, drainLimit: 3 * time.Minute,
+		draining: map[string]chan struct{}{}}
 }
 
 func (agent *Agent) Register(mux *http.ServeMux) {
@@ -160,7 +192,7 @@ func (agent *Agent) handleDeploy(writer http.ResponseWriter, request *http.Reque
 		return
 	}
 	if healthURL := agent.healthURLs[payload.Service]; healthURL != "" {
-		if err := waitHealthy(healthURL, 90*time.Second); err != nil {   // compose 성공 ≠ 서비스 정상 (F7)
+		if err := waitHealthy(healthURL, 90*time.Second); err != nil { // compose 성공 ≠ 서비스 정상 (F7)
 			agent.logger.Log(requestID, fmt.Sprintf("agent deploy unhealthy %s: %s", payload.Service, err), "error")
 			shared.WriteFail(writer, http.StatusInternalServerError, "deploy_unhealthy", err.Error())
 			return
@@ -172,7 +204,8 @@ func (agent *Agent) handleDeploy(writer http.ResponseWriter, request *http.Reque
 
 // composeDeploy — git pull + 호스트 재빌드 (사용자 결정 2026-08-29: 전달 채널 = git 하나).
 // 순서: ① fetch(요청 sha 포함되도록 depth 50) ② reset --hard <sha> — 정확히 그 커밋 배포
-//       ③ compose up -d --build <대상 서비스만> (무관 서비스 재생성 차단)
+//
+//	③ compose up -d --build <대상 서비스만> (무관 서비스 재생성 차단)
 func (agent *Agent) composeDeploy(directory, commitSha, composeService string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute) // 호스트 빌드 여유(backend gradle 수 분)
 	defer cancel()
