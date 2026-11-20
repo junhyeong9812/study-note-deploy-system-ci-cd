@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -123,14 +124,20 @@ func (agent *Agent) buildService(service string) string {
 	return agent.composeServices[service]
 }
 
-// runningService — 지금 운영 중인 compose 서비스. 두 자리 방식이면 활성 파일이 가리키는 자리.
+// runningService — 지금 운영 중인 compose 서비스. 두 자리 방식이면 nginx가 실제로 보내는 자리(응답 기준).
+// 외부 포트가 응답하지 않으면(서비스가 죽어 있어 고치는 배포일 수 있다) 활성 파일의 표식을 차선으로 쓴다.
 func (agent *Agent) runningService(directory, service string) string {
 	if agent.modes[service] != modeBlueGreen {
 		return agent.composeServices[service]
 	}
-	slot, err := activeSlotFromFile(directory)
-	if err != nil {
-		return ""
+	slot, err := agent.probeSlot(agent.healthURLs[service])
+	if err != nil || !validSlot(slot) {
+		content, readErr := os.ReadFile(filepath.Join(directory, activeFile))
+		if readErr != nil || markedSlot(string(content)) == "" {
+			return ""
+		}
+		slot = markedSlot(string(content))
+		agent.logger.Log("ci", fmt.Sprintf("%s 실제 자리 확인 불가(%v) — 활성 파일의 자리 %s 를 기준으로 삼음", service, err, slot), "warning")
 	}
 	return agent.slotService(service, slot)
 }

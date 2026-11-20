@@ -44,6 +44,7 @@ type Agent struct {
 	probeBudget       time.Duration
 	drainPollInterval time.Duration
 	drainLimit        time.Duration // 구 버전에 남은 연결을 기다리는 상한
+	drainWaitMargin   time.Duration // 다음 CD가 앞선 정리를 기다릴 때 상한에 더하는 여유(자리 정지 시간)
 	drainMutex        sync.Mutex
 	draining          map[string]chan struct{} // 서비스 → 진행 중인 정리(끝나면 닫힌다)
 	background        sync.WaitGroup
@@ -85,7 +86,7 @@ func New(logger *shared.Logger) *Agent {
 		modes: modes, slotHealthURLs: slotHealthURLs, slotDrainURLs: slotDrainURLs,
 		probeSlot: probeSlot, notifyDrain: notifyDrain,
 		probeInterval: time.Second, probeBudget: 30 * time.Second,
-		drainPollInterval: 2 * time.Second, drainLimit: 3 * time.Minute,
+		drainPollInterval: 2 * time.Second, drainLimit: 3 * time.Minute, drainWaitMargin: 40 * time.Second,
 		draining: map[string]chan struct{}{}}
 }
 

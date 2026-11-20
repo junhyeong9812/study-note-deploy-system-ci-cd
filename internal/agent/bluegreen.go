@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -109,7 +108,10 @@ func notifyDrain(drainURL string) error {
 
 // deliverBlueGreen — CD. 전환 전에 실패하면 nginx를 건드리지 않고, reload를 시도한 뒤 실패하면 이전 자리로 되돌린다.
 func (agent *Agent) deliverBlueGreen(service, commitSha string) (string, error) {
-	agent.waitDrained(service) // 0. 앞선 정리가 끝난 뒤에 시작한다 — 두 자리를 동시에 재사용하지 않는다
+	// 0. 앞선 정리가 끝난 뒤에 시작한다 — 두 자리를 동시에 재사용하지 않는다. 끝나지 않으면 진행하지 않는다.
+	if !agent.waitDrained(service) {
+		return "", &stageError{StageUp, "앞선 배포의 자리 정리가 상한을 넘겨도 끝나지 않음 — 서버에서 두 자리 상태 확인 필요"}
+	}
 	directory := agent.directories[service]
 	publicURL := agent.healthURLs[service]
 	slotURLs := agent.slotHealthURLs[service]
@@ -206,6 +208,13 @@ func (agent *Agent) deliverBlueGreen(service, commitSha string) (string, error) 
 	revert := func() (string, error) {
 		restoreActiveFile()
 		undo("nginx 되돌림 reload", "exec", "-T", proxyService, "nginx", "-s", "reload")
+		// 구 자리로 돌아온 것을 확인한 뒤에만 대상 자리를 정리한다. 확인하지 못하면 nginx가 대상 자리로
+		// 보내고 있을 수 있다 — 어느 자리도 내리지 않고 사람이 보게 남긴다.
+		if err := agent.waitSlot(publicURL, activeSlot); err != nil {
+			combined.WriteString("\n되돌림 미확인 — 두 자리를 모두 그대로 둔다(서버에서 확인 필요): " + err.Error() + "\n")
+			agent.logger.Log("cd", fmt.Sprintf("%s 되돌림 미확인 — 두 자리 유지: %v", service, err), "error")
+			return fail(StageSwitch)
+		}
 		agent.startDrain(service, targetSlot, "")
 		return fail(StageSwitch)
 	}
@@ -239,7 +248,7 @@ func (agent *Agent) waitSlot(publicURL, wantedSlot string) error {
 }
 
 // startDrain — 자리 정리(뒷일). 남은 연결이 끝나면 바로, 아니면 상한에 그 자리를 내린다.
-// deployedSha가 있으면(성공한 배포 뒤) 오래된 이미지도 정리한다.
+// deployedSha가 있으면(성공한 배포 뒤) 오래된 이미지도 정리한다 — 다음 CD는 이미지 정리를 기다리지 않는다.
 func (agent *Agent) startDrain(service, slot, deployedSha string) {
 	done := make(chan struct{})
 	agent.drainMutex.Lock()
@@ -249,18 +258,16 @@ func (agent *Agent) startDrain(service, slot, deployedSha string) {
 	agent.background.Add(1)
 	go func() {
 		defer agent.background.Done()
-		defer func() {
-			agent.drainMutex.Lock()
-			if agent.draining[service] == done {
-				delete(agent.draining, service)
-			}
-			agent.drainMutex.Unlock()
-			close(done)
-		}()
 		if previous != nil {
 			<-previous // 같은 서비스의 정리는 하나씩
 		}
 		agent.drain(service, slot)
+		agent.drainMutex.Lock()
+		if agent.draining[service] == done {
+			delete(agent.draining, service)
+		}
+		agent.drainMutex.Unlock()
+		close(done)
 		if deployedSha != "" {
 			agent.retainImages(agent.directories[service], service, deployedSha)
 		}
@@ -286,6 +293,13 @@ func (agent *Agent) drain(service, slot string) {
 		}
 		time.Sleep(agent.drainPollInterval)
 	}
+	// 내리기 직전에 한 번 더 확인한다: nginx가 지금 이 자리로 보내고 있거나 알 수 없으면 내리지 않는다.
+	// (되돌림이 실제로는 적용되지 않았거나, 그사이 상태가 바뀐 경우 운영 중인 자리를 내리지 않기 위해)
+	servingSlot, err := agent.probeSlot(agent.healthURLs[service])
+	if err != nil || servingSlot == slot || !validSlot(servingSlot) {
+		agent.logger.Log("drain", fmt.Sprintf("자리 정지 보류 %s — nginx가 보내는 자리 %q, 오류 %v. 다음 배포가 실제 상태를 보고 정리한다", slotService, servingSlot, err), "error")
+		return
+	}
 	if output, err := agent.run(ctx, directory, nil, "docker", "compose", "stop", slotService); err != nil {
 		agent.logger.Log("drain", fmt.Sprintf("자리 정지 실패 %s — 다음 배포가 다시 내린다: %s", slotService, tail(output, 200)), "error")
 		return
@@ -293,12 +307,19 @@ func (agent *Agent) drain(service, slot string) {
 	agent.logger.Log("drain", "자리 정리 완료 "+slotService, "info")
 }
 
-func (agent *Agent) waitDrained(service string) {
+// waitDrained — 같은 서비스의 정리가 끝날 때까지 기다린다. 상한(정리 상한 + 여유)을 넘으면 false.
+func (agent *Agent) waitDrained(service string) bool {
 	agent.drainMutex.Lock()
 	done := agent.draining[service]
 	agent.drainMutex.Unlock()
-	if done != nil {
-		<-done
+	if done == nil {
+		return true
+	}
+	select {
+	case <-done:
+		return true
+	case <-time.After(agent.drainLimit + agent.drainWaitMargin):
+		return false
 	}
 }
 
@@ -309,26 +330,53 @@ func (agent *Agent) waitBackground() { agent.background.Wait() }
 // 실제 활성 자리의 반대쪽을 정리한다. 실제 자리를 모르면 아무것도 내리지 않는다.
 func (agent *Agent) ReconcileSlots() {
 	for service := range agent.directories {
-		if agent.modes[service] != modeBlueGreen {
-			continue
-		}
-		activeSlot, err := agent.probeSlot(agent.healthURLs[service])
-		if err != nil || !validSlot(activeSlot) {
-			agent.logger.Log("boot", fmt.Sprintf("%s 활성 자리 확인 불가(자리 %q, %v) — 정리하지 않음", service, activeSlot, err), "warning")
-			continue
-		}
-		agent.startDrain(service, otherSlot(activeSlot), "")
+		agent.reconcileSlot(service)
 	}
 }
 
-// activeSlotFromFile — CI의 원복 기준·이미지 정리용. 네트워크 없이 파일 표식만 본다.
-func activeSlotFromFile(directory string) (string, error) {
-	content, err := os.ReadFile(filepath.Join(directory, activeFile))
-	if err != nil {
-		return "", err
+// ReconcileSlotsUntil — 서버가 막 부팅했으면 앱과 nginx가 뜨는 데 시간이 걸린다.
+// 실제 자리를 확인할 수 있을 때까지 간격을 두고 다시 시도한다(상한 있음).
+func (agent *Agent) ReconcileSlotsUntil(budget, interval time.Duration) {
+	pending := map[string]bool{}
+	for service := range agent.directories {
+		if agent.modes[service] == modeBlueGreen {
+			pending[service] = true
+		}
 	}
-	if slot := markedSlot(string(content)); slot != "" {
-		return slot, nil
+	deadline := time.Now().Add(budget) // budget이 0 이하면 확인될 때까지 계속한다
+	for len(pending) > 0 {
+		for service := range pending {
+			if agent.reconcileSlot(service) {
+				delete(pending, service)
+			}
+		}
+		if len(pending) == 0 || (budget > 0 && !time.Now().Before(deadline)) {
+			break
+		}
+		time.Sleep(interval)
 	}
-	return "", errors.New("활성 파일에 자리 표식이 없음")
+	for service := range pending {
+		agent.logger.Log("boot", service+" 활성 자리를 끝내 확인하지 못함 — 두 자리가 떠 있을 수 있다", "error")
+	}
+}
+
+// reconcileSlot — 실제 자리를 확인했으면 true.
+func (agent *Agent) reconcileSlot(service string) bool {
+	if agent.modes[service] != modeBlueGreen {
+		return true
+	}
+	activeSlot, err := agent.probeSlot(agent.healthURLs[service])
+	if err != nil || !validSlot(activeSlot) {
+		agent.logger.Log("boot", fmt.Sprintf("%s 활성 자리 확인 불가(자리 %q, %v) — 정리하지 않음", service, activeSlot, err), "warning")
+		return false
+	}
+	// 활성 파일이 실제와 다르면 맞춘다(파일을 바꾼 직후 agent가 죽은 경우 — nginx가 다시 뜰 때 엉뚱한 자리를 읽지 않게)
+	directory := agent.directories[service]
+	if content, err := os.ReadFile(filepath.Join(directory, activeFile)); err == nil && markedSlot(string(content)) != activeSlot {
+		if template, err := readSlotTemplate(directory, activeSlot); err == nil && writeActiveFile(directory, template) == nil {
+			agent.logger.Log("boot", fmt.Sprintf("%s 활성 파일을 실제 자리(%s)에 맞춤", service, activeSlot), "warning")
+		}
+	}
+	agent.startDrain(service, otherSlot(activeSlot), "")
+	return true
 }
