@@ -368,6 +368,13 @@ func (agent *Agent) drain(service, slot string) {
 	ctx, cancel := context.WithTimeout(context.Background(), agent.drainLimit+switchBudget)
 	defer cancel()
 	deadline := time.Now().Add(agent.drainLimit)
+	// reload 직후에는 nginx가 아직 구 worker를 "종료 중"으로 바꾸지 않았을 수 있다(새 worker를 띄운 뒤 구 worker에 신호를 보낸다).
+	// 그 틈에 보면 "남은 연결 없음"으로 잘못 읽으므로, 자리를 잡을 시간을 준 뒤에 본다.
+	settle := agent.drainSettle
+	if limit := agent.drainLimit / 10; settle > limit { // 기다림 상한이 짧게 잡힌 구성에서는 그에 비례해 줄인다
+		settle = limit
+	}
+	time.Sleep(settle)
 	// 기다림과 정지는 시간 예산을 따로 쓴다 — 상한까지 기다린 뒤에도 컨테이너가 정상 종료할 시간이 남아야 한다.
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), agent.drainLimit+agent.drainWaitMargin)
 	defer stopCancel()
@@ -381,7 +388,12 @@ func (agent *Agent) drain(service, slot string) {
 	}
 	// 내리기 직전에 한 번 더 확인한다: nginx가 지금 이 자리로 보내고 있거나 알 수 없으면 내리지 않는다.
 	// (되돌림이 실제로는 적용되지 않았거나, 그사이 상태가 바뀐 경우 운영 중인 자리를 내리지 않기 위해)
+	// reload 직후의 짧은 틈에는 구 worker가 한두 요청을 더 받을 수 있다 — 한 번 보고 단정하지 않고 몇 번 다시 본다.
 	servingSlot, err := agent.servingSlot(agent.healthURLs[service])
+	for attempt := 0; attempt < 5 && err == nil && servingSlot == slot; attempt++ {
+		time.Sleep(agent.probeInterval)
+		servingSlot, err = agent.servingSlot(agent.healthURLs[service])
+	}
 	if err != nil || servingSlot == slot {
 		agent.logger.Log("drain", fmt.Sprintf("자리 정지 보류 %s — nginx가 보내는 자리 %q, 오류 %v. 다음 배포가 실제 상태를 보고 정리한다", slotService, servingSlot, err), "error")
 		return
