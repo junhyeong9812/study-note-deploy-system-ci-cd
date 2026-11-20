@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -292,5 +294,54 @@ func TestIntegrationFallsBackToActiveFileWhenProbeFails(t *testing.T) {
 	}
 	if joined := strings.Join(lines, "\n"); !strings.Contains(joined, "docker compose ps -q wrapper-green") {
 		t.Fatalf("응답이 없으면 활성 파일의 자리를 차선으로 써야 한다:\n%s", joined)
+	}
+}
+
+func TestReconcileDoesNotStopWhenActiveFileCannotBeAligned(t *testing.T) {
+	// 파일은 green, nginx는 blue. green을 내리려면 먼저 파일을 blue로 고쳐야 하는데 blue 템플릿이 없다.
+	agent, world := slotNewAgent(t, slotSetup{activeContent: slotGreenTemplate, servingSlot: "blue"})
+	if err := os.Remove(filepath.Join(agent.directories["llm"], "deploy", "nginx", "upstream-blue.conf")); err != nil {
+		t.Fatal(err)
+	}
+	agent.ReconcileSlots()
+	slotWaitBackground(t, agent)
+	if supplementStopped(world, "green") || supplementStopped(world, "blue") {
+		t.Fatalf("활성 파일이 가리키는 자리를 내렸다 — nginx가 다시 뜨면 갈 곳이 없다:\n%s", slotDescribe(world.snapshot()))
+	}
+	slotRequireActiveContent(t, world, slotGreenTemplate, "맞추지 못한 경우")
+}
+
+func TestReconcileWaitsForDeliveryInProgress(t *testing.T) {
+	// CD가 대상 자리(green)를 띄우는 동안 기동 시 정리가 그 자리를 정리 대상으로 삼으면 안 된다
+	agent, world := slotNewAgent(t, slotSetup{activeContent: slotBlueTemplate, servingSlot: "blue"})
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	agent.waitHealthy = func(healthURL string, budget time.Duration) error {
+		once.Do(func() { close(started) })
+		<-release // CD가 대상 자리의 헬스를 기다리는 중
+		return world.waitHealthy(healthURL, budget)
+	}
+	delivered := make(chan int, 1)
+	go func() { delivered <- slotPost(agent, supplementCommit).Code }()
+	<-started
+	reconciled := make(chan struct{})
+	go func() { agent.ReconcileSlots(); close(reconciled) }()
+	select {
+	case <-reconciled:
+		t.Fatal("CD가 진행 중인데 기동 시 정리가 끼어들었다")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if supplementStopped(world, "green") && slotCount(world.snapshot(), "run", "stop wrapper-green") > 1 {
+		t.Fatalf("CD가 띄운 대상 자리를 정리가 내렸다:\n%s", slotDescribe(world.snapshot()))
+	}
+	close(release)
+	if code := <-delivered; code != 200 {
+		t.Fatalf("CD는 성공해야 한다: %d", code)
+	}
+	<-reconciled
+	slotWaitBackground(t, agent)
+	events := world.snapshot()
+	if last := slotFind(events, "run", "up -d", 0); last < 0 || slotFind(events, "run", "stop wrapper-green", last) >= 0 {
+		t.Fatalf("전환이 끝난 뒤 새 활성 자리(green)를 내렸다:\n%s", slotDescribe(events))
 	}
 }

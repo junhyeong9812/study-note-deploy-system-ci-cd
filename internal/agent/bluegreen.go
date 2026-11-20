@@ -360,22 +360,33 @@ func (agent *Agent) ReconcileSlotsUntil(budget, interval time.Duration) {
 	}
 }
 
-// reconcileSlot — 실제 자리를 확인했으면 true.
+// reconcileSlot — 실제 자리를 확인해 정리를 넘겼으면 true.
+// CI·CD와 같은 잠금을 쥐고 판단·등록한다: CD가 대상 자리를 띄우는 사이에 그 자리를 정리 대상으로 삼지 않게.
 func (agent *Agent) reconcileSlot(service string) bool {
 	if agent.modes[service] != modeBlueGreen {
 		return true
 	}
+	agent.busy.Lock()
+	defer agent.busy.Unlock()
 	activeSlot, err := agent.probeSlot(agent.healthURLs[service])
 	if err != nil || !validSlot(activeSlot) {
 		agent.logger.Log("boot", fmt.Sprintf("%s 활성 자리 확인 불가(자리 %q, %v) — 정리하지 않음", service, activeSlot, err), "warning")
 		return false
 	}
-	// 활성 파일이 실제와 다르면 맞춘다(파일을 바꾼 직후 agent가 죽은 경우 — nginx가 다시 뜰 때 엉뚱한 자리를 읽지 않게)
+	// 활성 파일이 실제와 다르면 맞춘다(파일을 바꾼 직후 agent가 죽은 경우 — nginx가 다시 뜰 때 엉뚱한 자리를 읽지 않게).
+	// 맞추지 못하면 반대쪽을 내리지 않는다: 파일이 가리키는 자리를 내리면 nginx 재기동 때 갈 곳이 없어진다.
 	directory := agent.directories[service]
-	if content, err := os.ReadFile(filepath.Join(directory, activeFile)); err == nil && markedSlot(string(content)) != activeSlot {
-		if template, err := readSlotTemplate(directory, activeSlot); err == nil && writeActiveFile(directory, template) == nil {
-			agent.logger.Log("boot", fmt.Sprintf("%s 활성 파일을 실제 자리(%s)에 맞춤", service, activeSlot), "warning")
+	content, err := os.ReadFile(filepath.Join(directory, activeFile))
+	if err != nil || markedSlot(string(content)) != activeSlot {
+		template, templateErr := readSlotTemplate(directory, activeSlot)
+		if templateErr == nil {
+			templateErr = writeActiveFile(directory, template)
 		}
+		if templateErr != nil {
+			agent.logger.Log("boot", fmt.Sprintf("%s 활성 파일을 실제 자리(%s)에 맞추지 못함 — 정리 보류: %v", service, activeSlot, templateErr), "error")
+			return false
+		}
+		agent.logger.Log("boot", fmt.Sprintf("%s 활성 파일을 실제 자리(%s)에 맞춤", service, activeSlot), "warning")
 	}
 	agent.startDrain(service, otherSlot(activeSlot), "")
 	return true
