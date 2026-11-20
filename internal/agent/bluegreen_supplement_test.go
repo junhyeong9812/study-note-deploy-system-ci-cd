@@ -445,3 +445,48 @@ func TestSwitchIsRefusedWhenLiveProxyConfigCannotBeRead(t *testing.T) {
 		t.Fatal("거절했는데 reload를 실행했다")
 	}
 }
+
+func TestDrainWaitsForReloadToSettleBeforeJudging(t *testing.T) {
+	// reload 직후의 틈: nginx가 아직 구 worker를 종료 중으로 표시하지 않았고, 구 worker가 한 요청을 더 받는다.
+	// 그 순간만 보고 "남은 연결 없음 + 아직 구 자리가 응답"으로 단정하면 구 자리가 영영 남는다(서버 실측 2026-11-20).
+	agent, world := slotNewAgent(t, slotSetup{activeContent: slotBlueTemplate, servingSlot: "blue"})
+	agent.drainSettle = 30 * time.Millisecond
+	probes := 0
+	var mutex sync.Mutex
+	settled := time.Now().Add(20 * time.Millisecond)
+	agent.probeSlot = func(healthURL string) (string, error) {
+		mutex.Lock()
+		probes++
+		mutex.Unlock()
+		if time.Now().Before(settled) {
+			return "blue", nil // 틈 사이에는 구 worker가 받는다
+		}
+		return "green", nil
+	}
+	agent.startDrain("llm", "blue", "")
+	slotWaitBackground(t, agent)
+	if !supplementStopped(world, "blue") {
+		t.Fatalf("reload가 자리 잡은 뒤에는 구 자리를 내려야 한다:\n%s", slotDescribe(world.snapshot()))
+	}
+}
+
+func TestDrainRechecksBeforeHoldingTheSlot(t *testing.T) {
+	// 첫 확인에서 구 자리가 응답했더라도 곧 새 자리로 바뀌면 내린다
+	agent, world := slotNewAgent(t, slotSetup{activeContent: slotBlueTemplate, servingSlot: "blue"})
+	calls := 0
+	var mutex sync.Mutex
+	agent.probeSlot = func(healthURL string) (string, error) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		calls++
+		if calls <= 2 {
+			return "blue", nil
+		}
+		return "green", nil
+	}
+	agent.startDrain("llm", "blue", "")
+	slotWaitBackground(t, agent)
+	if !supplementStopped(world, "blue") {
+		t.Fatalf("다시 확인해 새 자리가 응답하면 구 자리를 내려야 한다:\n%s", slotDescribe(world.snapshot()))
+	}
+}
