@@ -81,17 +81,37 @@ func writeActiveFile(directory, content string) error {
 	return os.Rename(temporary, path)
 }
 
-// probeSlot — 외부 헬스 URL이 200이고, nginx가 붙인 자리 표식이 무엇인지.
+// probeSlot — nginx가 붙인 자리 표식과, 응답이 200인지.
+// 200이 아니어도 표식은 돌려준다: 앱이 죽어 nginx가 502를 내는 상황에서도 "nginx가 어느 자리로 보내는지"는 알 수 있다.
 func probeSlot(healthURL string) (string, error) {
 	response, err := (&http.Client{Timeout: 3 * time.Second}).Get(healthURL)
 	if err != nil {
 		return "", err
 	}
 	defer response.Body.Close()
+	slot := response.Header.Get(slotHeader)
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status %d", response.StatusCode)
+		return slot, fmt.Errorf("status %d", response.StatusCode)
 	}
-	return response.Header.Get(slotHeader), nil
+	return slot, nil
+}
+
+// servingSlot — nginx가 지금 보내는 자리. 응답이 200이 아니어도 표식이 있으면 그 자리다(운영 중인 앱이 죽은 경우).
+// nginx 자체가 응답하지 않으면 알 수 없다 — 그때만 오류.
+func (agent *Agent) servingSlot(publicURL string) (string, error) {
+	var slot string
+	var err error
+	for attempt := 0; attempt < 3; attempt++ { // 일시적인 시간 초과 한 번으로 "모름"이 되지 않게
+		slot, err = agent.probeSlot(publicURL)
+		if validSlot(slot) {
+			return slot, nil
+		}
+		time.Sleep(agent.probeInterval)
+	}
+	if err == nil {
+		err = fmt.Errorf("자리 표식 없음(%q)", slot)
+	}
+	return "", err
 }
 
 func notifyDrain(drainURL string) error {
@@ -128,9 +148,9 @@ func (agent *Agent) deliverBlueGreen(service, commitSha string) (string, error) 
 	if markedSlot(previousContent) == "" {
 		return "", &stageError{StageSwitch, "활성 파일에 자리 표식(`" + slotMarkerPrefix + "blue|green`)이 없음"}
 	}
-	activeSlot, err := agent.probeSlot(publicURL)
-	if err != nil || !validSlot(activeSlot) {
-		return "", &stageError{StageSwitch, fmt.Sprintf("실제 활성 자리를 확인할 수 없음(자리 %q): %v", activeSlot, err)}
+	activeSlot, err := agent.servingSlot(publicURL)
+	if err != nil {
+		return "", &stageError{StageSwitch, "실제 활성 자리를 확인할 수 없음(nginx 무응답 또는 표식 없음): " + err.Error()}
 	}
 	if markedSlot(previousContent) != activeSlot { // 파일과 실제가 다르면 실제를 따른다
 		template, err := readSlotTemplate(directory, activeSlot)
@@ -295,8 +315,8 @@ func (agent *Agent) drain(service, slot string) {
 	}
 	// 내리기 직전에 한 번 더 확인한다: nginx가 지금 이 자리로 보내고 있거나 알 수 없으면 내리지 않는다.
 	// (되돌림이 실제로는 적용되지 않았거나, 그사이 상태가 바뀐 경우 운영 중인 자리를 내리지 않기 위해)
-	servingSlot, err := agent.probeSlot(agent.healthURLs[service])
-	if err != nil || servingSlot == slot || !validSlot(servingSlot) {
+	servingSlot, err := agent.servingSlot(agent.healthURLs[service])
+	if err != nil || servingSlot == slot {
 		agent.logger.Log("drain", fmt.Sprintf("자리 정지 보류 %s — nginx가 보내는 자리 %q, 오류 %v. 다음 배포가 실제 상태를 보고 정리한다", slotService, servingSlot, err), "error")
 		return
 	}
@@ -368,9 +388,9 @@ func (agent *Agent) reconcileSlot(service string) bool {
 	}
 	agent.busy.Lock()
 	defer agent.busy.Unlock()
-	activeSlot, err := agent.probeSlot(agent.healthURLs[service])
-	if err != nil || !validSlot(activeSlot) {
-		agent.logger.Log("boot", fmt.Sprintf("%s 활성 자리 확인 불가(자리 %q, %v) — 정리하지 않음", service, activeSlot, err), "warning")
+	activeSlot, err := agent.servingSlot(agent.healthURLs[service])
+	if err != nil {
+		agent.logger.Log("boot", fmt.Sprintf("%s 활성 자리 확인 불가(%v) — 정리하지 않음", service, err), "warning")
 		return false
 	}
 	// 활성 파일이 실제와 다르면 맞춘다(파일을 바꾼 직후 agent가 죽은 경우 — nginx가 다시 뜰 때 엉뚱한 자리를 읽지 않게).

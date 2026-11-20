@@ -130,8 +130,8 @@ func (agent *Agent) runningService(directory, service string) string {
 	if agent.modes[service] != modeBlueGreen {
 		return agent.composeServices[service]
 	}
-	slot, err := agent.probeSlot(agent.healthURLs[service])
-	if err != nil || !validSlot(slot) {
+	slot, err := agent.servingSlot(agent.healthURLs[service])
+	if err != nil {
 		content, readErr := os.ReadFile(filepath.Join(directory, activeFile))
 		if readErr != nil || markedSlot(string(content)) == "" {
 			return ""

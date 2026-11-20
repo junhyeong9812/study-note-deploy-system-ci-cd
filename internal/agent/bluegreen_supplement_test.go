@@ -345,3 +345,20 @@ func TestReconcileWaitsForDeliveryInProgress(t *testing.T) {
 		t.Fatalf("전환이 끝난 뒤 새 활성 자리(green)를 내렸다:\n%s", slotDescribe(events))
 	}
 }
+
+func TestDeliveryProceedsWhenActiveAppIsDownButProxyAnswers(t *testing.T) {
+	// 운영 중인 앱이 죽어 nginx가 502를 낸다. 표식으로 자리는 알 수 있으므로 고치는 배포가 진행돼야 한다.
+	agent, world := slotNewAgent(t, slotSetup{activeContent: slotBlueTemplate, servingSlot: "blue"})
+	agent.probeSlot = func(healthURL string) (string, error) {
+		slot, err := world.probe(healthURL)
+		if err == nil && slot == "blue" {
+			return slot, errors.New("status 502") // blue는 죽어 있다
+		}
+		return slot, err
+	}
+	if recorder := slotPost(agent, supplementCommit); recorder.Code != 200 {
+		t.Fatalf("죽은 자리에서 새 자리로 전환돼야 한다: %d %s", recorder.Code, recorder.Body.String())
+	}
+	slotWaitBackground(t, agent)
+	slotRequireActiveContent(t, world, slotGreenTemplate, "고치는 배포 뒤")
+}
