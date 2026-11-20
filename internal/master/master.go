@@ -46,6 +46,7 @@ type Master struct {
 	mutex    sync.Mutex
 	inFlight map[string]bool // 서비스별 single-flight — 진행 중이면 명시적 409
 	// 끝났지만 DB에 기록하지 못한 건. 조회는 이 값을 우선하고, 기록될 때까지 주기적으로 다시 쓴다.
+	alerts             *shared.AlertSender // 배포 실패를 알림 서버에 알린다(없으면 보내지 않는다)
 	unrecorded         map[string]Deployment
 	busyRetryInterval  time.Duration
 	storeRetryInterval time.Duration
@@ -55,7 +56,7 @@ type Master struct {
 func New(logger *shared.Logger) (*Master, error) {
 	agents := map[string]string{}
 	// AGENT_URL_FRONT=http://<host>:15001 형식 — 서비스 allowlist는 이 고정 열거가 정본
-	for _, service := range []string{"front", "backend", "llm"} {
+	for _, service := range []string{"front", "backend", "llm", "alert"} {
 		if agentURL := os.Getenv("AGENT_URL_" + strings.ToUpper(service)); agentURL != "" {
 			agents[service] = agentURL
 		}
@@ -70,6 +71,7 @@ func New(logger *shared.Logger) (*Master, error) {
 	}
 	master := &Master{secret: os.Getenv("DEPLOY_SECRET"), logger: logger, agents: agents,
 		store: store, inFlight: map[string]bool{}, unrecorded: map[string]Deployment{},
+		alerts:            shared.NewAlertSender("ci-cd", logger),
 		busyRetryInterval: 15 * time.Second, storeRetryInterval: 30 * time.Second}
 	closed, err := store.FailUnfinished(StageInterrupted, "master가 진행 중에 재시작됨", now())
 	if err != nil {
@@ -77,6 +79,10 @@ func New(logger *shared.Logger) (*Master, error) {
 	}
 	if closed > 0 {
 		logger.Log("boot", fmt.Sprintf("미완료 배포 %d건을 failed(interrupted)로 닫음", closed), "warning")
+		// 이것도 failed 로 끝난 배포다 — 건마다가 아니라 한 번에 알린다
+		master.alerts.Send("boot", "deploy_failed", "warning", "deploy-interrupted",
+			fmt.Sprintf("배포 %d건이 master 재시작으로 중단됨", closed),
+			"진행 중이던 배포를 failed(interrupted)로 닫았다. 해당 실행을 GitHub 에서 다시 돌려야 한다.")
 	}
 	return master, nil
 }
@@ -168,6 +174,10 @@ func (master *Master) advance(deployment Deployment, agentURL string) {
 		master.logger.Log(deployment.RequestID, fmt.Sprintf("deploy failed %s sha=%s stage=%s %s",
 			deployment.Service, deployment.CommitSha, stage, lastPart(detail, 200)), "error")
 		master.recordFinished(deployment)
+		// 사람이 알아야 한다 — GitHub 메일에만 기대지 않는다. 보내기에 실패해도 배포 결과는 그대로다.
+		master.alerts.Send(deployment.RequestID, "deploy_failed", "warning", "deploy-failed:"+deployment.Service+":"+deployment.CommitSha,
+			fmt.Sprintf("배포 실패 %s — 단계 %s", deployment.Service, stage),
+			fmt.Sprintf("커밋 %s\n%s", deployment.CommitSha, lastPart(detail, 800)))
 	}
 	enter := func(state string) bool {
 		deployment.State = state

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -488,5 +489,31 @@ func TestDrainRechecksBeforeHoldingTheSlot(t *testing.T) {
 	slotWaitBackground(t, agent)
 	if !supplementStopped(world, "blue") {
 		t.Fatalf("다시 확인해 새 자리가 응답하면 구 자리를 내려야 한다:\n%s", slotDescribe(world.snapshot()))
+	}
+}
+
+func TestDrainHoldIsReportedToAlertServer(t *testing.T) {
+	events := make(chan map[string]string, 4)
+	alertServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var event map[string]string
+		json.NewDecoder(request.Body).Decode(&event)
+		events <- event
+		writer.WriteHeader(http.StatusAccepted)
+	}))
+	defer alertServer.Close()
+	t.Setenv("ALERT_EVENTS_URL", alertServer.URL)
+	agent, world := slotNewAgent(t, slotSetup{activeContent: slotBlueTemplate, servingSlot: "blue"})
+	agent.startDrain("llm", "blue", "") // 정리 대상이 실제로는 응답 중인 자리 → 정지 보류
+	slotWaitBackground(t, agent)
+	if supplementStopped(world, "blue") {
+		t.Fatalf("응답 중인 자리를 내렸다:\n%s", slotDescribe(world.snapshot()))
+	}
+	select {
+	case event := <-events:
+		if event["kind"] != "slots_left" || event["source"] != "ci-cd-agent" || !strings.Contains(event["title"], "llm") {
+			t.Fatalf("자리 정지 보류를 알리는 내용이 다르다: %v", event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("자리를 내리지 못했는데 알림 서버에 알리지 않았다")
 	}
 }

@@ -225,6 +225,8 @@ func (agent *Agent) deliverBlueGreen(service, commitSha string) (string, error) 
 		if err != nil {
 			combined.WriteString("\n되돌림 실패(활성 파일 복원) — 대상 자리를 내리지 않고 둔다(서버에서 확인 필요): " + err.Error() + "\n")
 			agent.logger.Log("cd", fmt.Sprintf("%s 활성 파일 복원 실패 — 두 자리 유지: %v", service, err), "error")
+			agent.alerts.Send("cd", "slots_left", "critical", "slots-left:"+service,
+				"두 자리가 남았을 수 있음 "+service, "활성 파일을 이전 내용으로 되돌리지 못해 대상 자리를 내리지 않았다: "+err.Error())
 			return false
 		}
 		return true
@@ -280,6 +282,8 @@ func (agent *Agent) deliverBlueGreen(service, commitSha string) (string, error) 
 		if err := agent.waitServingSlot(publicURL, activeSlot); err != nil {
 			combined.WriteString("\n되돌림 미확인 — 두 자리를 모두 그대로 둔다(서버에서 확인 필요): " + err.Error() + "\n")
 			agent.logger.Log("cd", fmt.Sprintf("%s 되돌림 미확인 — 두 자리 유지: %v", service, err), "error")
+			agent.alerts.Send("cd", "slots_left", "critical", "slots-left:"+service,
+				"두 자리가 남았을 수 있음 "+service, "전환을 되돌렸지만 구 자리로 돌아온 것을 확인하지 못했다: "+err.Error())
 			return fail(StageSwitch)
 		}
 		agent.startDrain(service, targetSlot, "")
@@ -396,6 +400,9 @@ func (agent *Agent) drain(service, slot string) {
 	}
 	if err != nil || servingSlot == slot {
 		agent.logger.Log("drain", fmt.Sprintf("자리 정지 보류 %s — nginx가 보내는 자리 %q, 오류 %v. 다음 배포가 실제 상태를 보고 정리한다", slotService, servingSlot, err), "error")
+		agent.alerts.Send("drain", "slots_left", "warning", "slots-left:"+service,
+			"두 자리가 남았을 수 있음 "+service,
+			fmt.Sprintf("%s 를 내리지 않았다 — nginx 가 보내는 자리 %q, 오류 %v", slotService, servingSlot, err))
 		return
 	}
 	if output, err := agent.run(stopCtx, directory, nil, "docker", "compose", "stop", slotService); err != nil {
