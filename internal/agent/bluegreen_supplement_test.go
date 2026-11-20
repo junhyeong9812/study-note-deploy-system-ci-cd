@@ -362,3 +362,33 @@ func TestDeliveryProceedsWhenActiveAppIsDownButProxyAnswers(t *testing.T) {
 	slotWaitBackground(t, agent)
 	slotRequireActiveContent(t, world, slotGreenTemplate, "고치는 배포 뒤")
 }
+
+func TestTargetSlotIsKeptWhenActiveFileCannotBeRestored(t *testing.T) {
+	// nginx 설정 검사가 실패했는데 활성 파일 복원도 실패한다: 파일은 대상 자리(green)를 가리킨 채 남는다.
+	// 그 상태에서 green을 내리면 nginx가 다시 뜰 때 갈 곳이 없다.
+	agent, world := slotNewAgent(t, slotSetup{activeContent: slotBlueTemplate, servingSlot: "blue"})
+	activeDirectory := filepath.Join(agent.directories["llm"], "deploy", "active")
+	agent.run = func(ctx context.Context, directory string, environment []string, arguments ...string) (string, error) {
+		line := strings.Join(arguments, " ")
+		if strings.HasSuffix(line, "nginx -t") {
+			// 복원이 실패하도록 활성 디렉토리를 쓸 수 없는 것으로 바꾼다(디렉토리 자리에 일반 파일)
+			_ = os.RemoveAll(activeDirectory)
+			_ = os.WriteFile(activeDirectory, []byte("not a directory"), 0o644)
+			world.mutex.Lock()
+			world.events = append(world.events, slotEvent{kind: "run", text: line})
+			world.mutex.Unlock()
+			return "nginx: configuration file test failed", errors.New("exit status 1")
+		}
+		return world.run(ctx, directory, environment, arguments...)
+	}
+	recorder := slotPost(agent, supplementCommit)
+	slotRequireFailure(t, recorder, "cd_switch")
+	if !strings.Contains(recorder.Body.String(), "활성 파일 복원") {
+		t.Fatalf("복원 실패가 응답에 드러나지 않는다: %s", recorder.Body.String())
+	}
+	slotWaitBackground(t, agent)
+	events := world.snapshot()
+	if started := slotFind(events, "run", "up -d", 0); started < 0 || slotFind(events, "run", "stop wrapper-green", started) >= 0 {
+		t.Fatalf("활성 파일이 가리킬 수 있는 대상 자리를 내렸다:\n%s", slotDescribe(events))
+	}
+}

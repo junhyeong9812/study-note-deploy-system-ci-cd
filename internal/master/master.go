@@ -19,7 +19,7 @@ import (
 const (
 	// 합계가 워크플로 조회 상한(25분) 안에 들어와야 한다: 작업 중 대기 3분 + CI 11.5분 + CD 9분 = 23.5분
 	integrationCallTimeout = 11*time.Minute + 30*time.Second // agent CI 예산 10분 + 원복 1분 + 여유
-	deliveryCallTimeout    = 9 * time.Minute                 // 앞선 정리 대기 3분 40초 + 기동·헬스·전환 4분 30초 + 여유
+	deliveryCallTimeout    = 9 * time.Minute                 // 앞선 정리 대기 4분 10초 + 기동·헬스·전환 4분 30초 + 여유
 	busyRetryLimit         = 12                              // agent가 다른 작업 중일 때 다시 불러 보는 횟수 — 배포 한 건 전체(CI+CD) 합계
 	detailLimit            = 2000
 

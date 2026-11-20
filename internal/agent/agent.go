@@ -86,7 +86,7 @@ func New(logger *shared.Logger) *Agent {
 		modes: modes, slotHealthURLs: slotHealthURLs, slotDrainURLs: slotDrainURLs,
 		probeSlot: probeSlot, notifyDrain: notifyDrain,
 		probeInterval: time.Second, probeBudget: 30 * time.Second,
-		drainPollInterval: 2 * time.Second, drainLimit: 3 * time.Minute, drainWaitMargin: 40 * time.Second,
+		drainPollInterval: 2 * time.Second, drainLimit: 3 * time.Minute, drainWaitMargin: 70 * time.Second,
 		draining: map[string]chan struct{}{}}
 }
 

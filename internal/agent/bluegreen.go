@@ -185,10 +185,15 @@ func (agent *Agent) deliverBlueGreen(service, commitSha string) (string, error) 
 			combined.WriteString(fmt.Sprintf("\n되돌림 실패(%s): %s %v\n", description, tail(output, 300), err))
 		}
 	}
-	restoreActiveFile := func() {
+	// 활성 파일을 이전 내용으로 되돌린다. 실패하면 파일이 대상 자리를 가리킨 채 남는다 —
+	// 그 상태에서 대상 자리를 내리면 nginx가 다시 뜰 때 갈 곳이 없으므로, 호출한 쪽은 대상 자리를 내리지 않는다.
+	restoreActiveFile := func() bool {
 		if err := writeActiveFile(directory, previousContent); err != nil {
-			combined.WriteString("\n되돌림 실패(활성 파일 복원): " + err.Error() + "\n")
+			combined.WriteString("\n되돌림 실패(활성 파일 복원) — 대상 자리를 내리지 않고 둔다(서버에서 확인 필요): " + err.Error() + "\n")
+			agent.logger.Log("cd", fmt.Sprintf("%s 활성 파일 복원 실패 — 두 자리 유지: %v", service, err), "error")
+			return false
 		}
+		return true
 	}
 	fail := func(stage string) (string, error) { return combined.String(), &stageError{stage, combined.String()} }
 
@@ -214,20 +219,25 @@ func (agent *Agent) deliverBlueGreen(service, commitSha string) (string, error) 
 	}
 	if err != nil {
 		combined.WriteString("\n활성 파일 교체 실패: " + err.Error() + "\n")
-		restoreActiveFile()
-		undo("대상 자리 정지", "stop", targetService)
+		if restoreActiveFile() {
+			undo("대상 자리 정지", "stop", targetService)
+		}
 		return fail(StageSwitch)
 	}
 	if err := compose(nil, "exec", "-T", proxyService, "nginx", "-t"); err != nil {
-		restoreActiveFile()
-		undo("대상 자리 정지", "stop", targetService)
+		if restoreActiveFile() {
+			undo("대상 자리 정지", "stop", targetService)
+		}
 		return fail(StageSwitch)
 	}
 	// 7~8. reload → 새 자리가 실제로 응답하는지. reload를 시도한 뒤에는 대상 자리에 연결이 들어갔을 수 있다:
 	//      되돌리더라도 대상 자리를 바로 내리지 않고 정리 절차로 넘긴다.
 	revert := func() (string, error) {
-		restoreActiveFile()
+		restored := restoreActiveFile()
 		undo("nginx 되돌림 reload", "exec", "-T", proxyService, "nginx", "-s", "reload")
+		if !restored {
+			return fail(StageSwitch)
+		}
 		// 구 자리로 돌아온 것을 확인한 뒤에만 대상 자리를 정리한다. 확인하지 못하면 nginx가 대상 자리로
 		// 보내고 있을 수 있다 — 어느 자리도 내리지 않고 사람이 보게 남긴다.
 		if err := agent.waitSlot(publicURL, activeSlot); err != nil {
@@ -305,6 +315,9 @@ func (agent *Agent) drain(service, slot string) {
 	ctx, cancel := context.WithTimeout(context.Background(), agent.drainLimit+switchBudget)
 	defer cancel()
 	deadline := time.Now().Add(agent.drainLimit)
+	// 기다림과 정지는 시간 예산을 따로 쓴다 — 상한까지 기다린 뒤에도 컨테이너가 정상 종료할 시간이 남아야 한다.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), agent.drainLimit+agent.drainWaitMargin)
+	defer stopCancel()
 	for time.Now().Before(deadline) {
 		// 종료 중인 nginx worker가 남아 있다 = 전환 전에 열린 연결이 아직 있다
 		processes, err := agent.run(ctx, directory, nil, "docker", "compose", "exec", "-T", proxyService, "ps")
@@ -320,7 +333,7 @@ func (agent *Agent) drain(service, slot string) {
 		agent.logger.Log("drain", fmt.Sprintf("자리 정지 보류 %s — nginx가 보내는 자리 %q, 오류 %v. 다음 배포가 실제 상태를 보고 정리한다", slotService, servingSlot, err), "error")
 		return
 	}
-	if output, err := agent.run(ctx, directory, nil, "docker", "compose", "stop", slotService); err != nil {
+	if output, err := agent.run(stopCtx, directory, nil, "docker", "compose", "stop", slotService); err != nil {
 		agent.logger.Log("drain", fmt.Sprintf("자리 정지 실패 %s — 다음 배포가 다시 내린다: %s", slotService, tail(output, 200)), "error")
 		return
 	}
