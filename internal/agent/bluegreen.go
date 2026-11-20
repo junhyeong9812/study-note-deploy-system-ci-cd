@@ -205,7 +205,11 @@ func (agent *Agent) deliverBlueGreen(service, commitSha string) (string, error) 
 			}
 			return err
 		}
-		if previousProxyConfigErr == nil && string(previousProxyConfig) == string(source) {
+		if previousProxyConfigErr != nil {
+			// nginx가 응답 중인데 운영 사본을 읽을 수 없다 — 되돌릴 내용을 모르는 채로는 바꾸지 않는다
+			return fmt.Errorf("nginx 본 설정의 운영 사본을 읽을 수 없어 교체하지 않음: %w", previousProxyConfigErr)
+		}
+		if string(previousProxyConfig) == string(source) {
 			return nil
 		}
 		proxyConfigChanged = true
@@ -215,7 +219,7 @@ func (agent *Agent) deliverBlueGreen(service, commitSha string) (string, error) 
 	// 그 상태에서 대상 자리를 내리면 nginx가 다시 뜰 때 갈 곳이 없으므로, 호출한 쪽은 대상 자리를 내리지 않는다.
 	restoreActiveFile := func() bool {
 		err := writeActiveFile(directory, previousContent)
-		if err == nil && proxyConfigChanged && previousProxyConfigErr == nil {
+		if err == nil && proxyConfigChanged {
 			err = writeFileAtomically(proxyConfigPath, string(previousProxyConfig))
 		}
 		if err != nil {

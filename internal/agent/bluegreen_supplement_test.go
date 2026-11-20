@@ -427,3 +427,21 @@ func TestProbeSlotReturnsMarkerEvenWhenStatusIsNotOk(t *testing.T) {
 		t.Fatal("응답 없음은 오류여야 한다")
 	}
 }
+
+func TestSwitchIsRefusedWhenLiveProxyConfigCannotBeRead(t *testing.T) {
+	// repo에는 새 본 설정이 있는데 운영 사본이 없다(읽을 수 없다): 되돌릴 내용을 모르므로 바꾸지 않는다
+	agent, world := slotNewAgent(t, slotSetup{activeContent: slotBlueTemplate, servingSlot: "blue"})
+	directory := agent.directories["llm"]
+	if err := os.WriteFile(filepath.Join(directory, "deploy", "nginx", "nginx.conf"), []byte("# 새 커밋의 설정\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	slotRequireFailure(t, slotPost(agent, supplementCommit), "cd_switch")
+	slotWaitBackground(t, agent)
+	if _, err := os.Stat(filepath.Join(directory, "deploy", "active", "nginx.conf")); err == nil {
+		t.Fatal("되돌릴 수 없는 상태에서 운영 사본을 새로 썼다")
+	}
+	slotRequireActiveContent(t, world, slotBlueTemplate, "거절 뒤")
+	if slotCount(world.snapshot(), "run", "nginx -s reload") != 0 {
+		t.Fatal("거절했는데 reload를 실행했다")
+	}
+}

@@ -40,3 +40,35 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 - 가드: fail-closed 시크릿(상수시간) · 서비스/디렉토리 고정 열거 · 커밋 sha hex 검증(**master가 접수 전에**) · master 서비스별 + agent single-flight · CI 실패 시 CD 미호출 · 배포 후 헬스 확인(DEPLOY_HEALTH_*) · 이력을 기록하지 못하면 접수 거절 · http 타임아웃
 - 수용 리스크(명문화): git-pull 방식은 저장소 커밋이 compose를 바꿀 수 있다 — main의 PR 게이트·자기 소유 repo가 신뢰 경계. HMAC+타임스탬프(재전송 방지)는 후속 이슈
 - 구동: `.env` 작성 후 `docker compose up -d --build` · 테스트: `go test ./...`
+
+
+## 무중단 배포(blue/green) — 서비스별로 켠다
+
+`DEPLOY_MODE_<SVC>=bluegreen` 인 서비스는 앱을 두 자리(`<기준>-blue`·`<기준>-green`)로 두고 nginx 가 그중 하나로 보낸다. 켜지 않은 서비스는 위의 단일 컨테이너 방식 그대로다.
+
+- agent 설정: `DEPLOY_MODE_<SVC>=bluegreen` · `DEPLOY_HEALTH_<SVC>`(nginx 경유 외부 포트) · `DEPLOY_HEALTH_<SVC>_BLUE`·`_GREEN`(자리별 127.0.0.1 포트) · `DEPLOY_DRAIN_<SVC>_BLUE`·`_GREEN`(선택 — 구 자리에 정리 시작을 알리는 URL)
+- 서버의 `deploy/active/`(git 에 없다)가 nginx 가 읽는 전부다: `nginx.conf`(repo `deploy/nginx/nginx.conf` 의 운영 사본) + `upstream.conf`(활성 자리, 첫 줄 `# slot: blue|green`). agent 가 전환할 때 둘을 갱신하고, 실패하면 이전 내용으로 되돌린다.
+- 판정 기준은 파일이 아니라 nginx 응답의 `X-Deploy-Slot` 헤더다.
+
+### 최초 전환(서버에서 한 번, 수 초 중단)
+```
+cd <배포 디렉토리>
+mkdir -p deploy/active
+cp deploy/nginx/nginx.conf deploy/active/nginx.conf
+cp deploy/nginx/upstream-blue.conf deploy/active/upstream.conf
+docker stop <기존 앱 컨테이너>            # 외부 포트를 nginx 에 넘긴다
+IMAGE_TAG=<운영 중인 sha> docker compose up -d --no-build <기준>-blue nginx
+curl -sD- -o /dev/null <외부 헬스 URL> | grep -i x-deploy-slot   # blue
+```
+
+### 손으로 확인·조작
+```
+curl -sD- -o /dev/null <외부 헬스 URL> | grep -i x-deploy-slot     # 지금 응답하는 자리
+head -1 deploy/active/upstream.conf                               # 파일이 가리키는 자리
+docker compose --profile blue --profile green ps                  # 떠 있는 자리(평소 하나)
+# 자리를 손으로 바꿀 때: 대상 자리를 띄워 헬스를 확인한 뒤
+cp deploy/nginx/upstream-green.conf deploy/active/upstream.conf && docker compose exec -T nginx nginx -t && docker compose exec -T nginx nginx -s reload
+docker compose stop <기준>-blue                                    # 남은 연결이 끝난 뒤(최대 3분)
+```
+- 이름 없이 `docker compose up -d` 를 해도 두 자리는 뜨지 않는다(자리에는 profiles 가 붙어 있다).
+- 배포가 `cd_switch` + "되돌림 미확인"/"활성 파일 복원 실패"로 끝났으면 두 자리가 모두 떠 있을 수 있다. 위 명령으로 응답 자리를 확인하고 반대쪽을 내린다. 다음 배포도 실제 응답 자리를 기준으로 정리한다.
