@@ -70,3 +70,16 @@ func TestDeployAcceptsKnownService(t *testing.T) {
 		t.Fatalf("정상 요청 거절: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestDeployAcceptsObserveServiceWhenConfigured(t *testing.T) {
+	t.Setenv("AGENT_URL_OBSERVE", "http://127.0.0.1:1") // 닫힌 포트 — 접수만 본다
+	master := newTestMaster(t)
+	recorder := request(master, true, `{"service":"observe","commit_sha":"abc1234def"}`)
+	if recorder.Code != 202 || !strings.Contains(recorder.Body.String(), `"success":true`) {
+		t.Fatalf("배포 대상 observe 가 거절됨: %d %s", recorder.Code, recorder.Body.String())
+	}
+	recorder = request(master, true, `{"service":"observer","commit_sha":"abc1234def"}`)
+	if recorder.Code != 422 || !strings.Contains(recorder.Body.String(), "unknown_service") {
+		t.Fatalf("목록 밖 서비스가 통과: %d %s", recorder.Code, recorder.Body.String())
+	}
+}

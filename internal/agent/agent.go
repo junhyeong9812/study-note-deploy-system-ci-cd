@@ -58,7 +58,7 @@ func New(logger *shared.Logger) *Agent {
 	modes := map[string]string{}
 	slotHealthURLs := map[string]map[string]string{}
 	slotDrainURLs := map[string]map[string]string{}
-	for _, service := range []string{"front", "backend", "llm", "alert"} {
+	for _, service := range []string{"front", "backend", "llm", "alert", "observe"} {
 		if directory := os.Getenv("DEPLOY_DIR_" + strings.ToUpper(service)); directory != "" {
 			directories[service] = directory
 		}
