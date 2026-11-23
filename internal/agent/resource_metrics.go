@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -121,6 +122,10 @@ type ResourceCollector struct {
 	previousContainers map[string]containerSample          // 컨테이너 전체 ID → 앞 표본
 	failureStreak      int64                               // 지금 이어지는 전송 실패 횟수(mutex 아래)
 	skipping           bool                                // 지금 이어지는 건너뜀(mutex 아래) — 첫 번에만 로그
+	gpuExecID          string                              // 끝났다고 확인하지 못한 GPU 조회용 실행(§12) — 있으면 새로 만들지 않는다
+	gpuSkipStreak      int64                               // 지금 이어지는 GPU 건너뜀
+	gpuSkipStartedAt   time.Duration                       // 그 건너뜀이 시작된 단조 시각
+	gpuSkipLoggedAt    time.Duration                       // 그 건너뜀의 마지막 로그 단조 시각
 }
 
 type cpuSample struct {
@@ -669,11 +674,33 @@ func containerMemoryUsed(stats dockerContainerStats) *uint64 {
 
 const mebibyte = 1048576
 
-// readGPUs — 고정 명령 하나. 종료 코드가 0 이 아니거나 · 어느 줄이든 꼴이 틀리거나 · 줄이 없으면 오류(갈래 전체 결측).
+// readGPUs — 고정 명령 하나(§12 — 조회용 실행은 한 번에 하나만 살아 있다). 전부 GPU 기한 안이다.
+//   - 남은 실행(gpuExecID)이 있으면 먼저 그 상태를 묻는다: 끝남 · 사라짐(404) → 잊고 새로 조회, 도는 중 · 알 수 없음 → 건너뛴다.
+//   - 실행은 만든 즉시 기억한다(시작 전에). 끝났다고 확인한 뒤에만 잊는다 — 시작 오류 · 기한 초과 · 끝내 도는 중이면 남은 실행이다.
+//   - 종료 코드가 0 이 아니거나 · 어느 줄이든 꼴이 틀리거나 · 줄이 없으면 오류(갈래 전체 결측).
 func (collector *ResourceCollector) readGPUs(parent context.Context) ([]GPUResource, error) {
 	ctx, cancel := context.WithTimeout(parent, collector.gpuDeadline)
 	defer cancel()
-	output, exitCode, err := collector.docker.execQuery(ctx, collector.settings.GPUContainer, gpuQueryCommand)
+	if collector.gpuExecID != "" {
+		running, _, err := collector.docker.inspectExec(ctx, collector.gpuExecID)
+		if (err != nil && !errors.Is(err, errDockerNotFound)) || (err == nil && running) { // 도는 중 · 알 수 없음
+			collector.noteGPUSkipped()
+			return nil, errors.New("gpu query skipped: previous exec may still be running")
+		}
+		collector.gpuExecID = "" // 끝났거나 사라졌다
+		collector.noteGPUResumed()
+	}
+
+	id, err := collector.docker.createExec(ctx, collector.settings.GPUContainer, gpuQueryCommand)
+	if err != nil {
+		return nil, err
+	}
+	collector.gpuExecID = id
+	output, err := collector.docker.startExec(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	exitCode, err := collector.waitGPUExecExit(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -681,6 +708,63 @@ func (collector *ResourceCollector) readGPUs(parent context.Context) ([]GPUResou
 		return nil, fmt.Errorf("gpu query exit code %d", exitCode)
 	}
 	return parseGPUQuery(output)
+}
+
+// waitGPUExecExit — 출력이 끝난 뒤 실행의 종료 상태. 도커의 종료 처리가 출력 닫힘보다 늦을 수 있어 ctx 기한 안에서 짧게 다시 묻는다.
+// 끝났으면(또는 사라졌으면) 기억을 지운다. 기한까지 도는 중이거나 상태를 알 수 없으면 기억을 남기고 오류.
+func (collector *ResourceCollector) waitGPUExecExit(ctx context.Context, id string) (int, error) {
+	for {
+		running, exitCode, err := collector.docker.inspectExec(ctx, id)
+		if errors.Is(err, errDockerNotFound) {
+			collector.gpuExecID = ""
+			return 0, err
+		}
+		if err != nil {
+			return 0, err
+		}
+		if !running {
+			collector.gpuExecID = ""
+			return exitCode, nil
+		}
+		select {
+		case <-ctx.Done():
+			return 0, fmt.Errorf("gpu exec still running: %w", ctx.Err())
+		case <-time.After(gpuExecPollInterval):
+		}
+	}
+}
+
+const gpuExecPollInterval = 50 * time.Millisecond // 끝난 직후 종료 상태를 다시 묻는 간격
+const gpuStuckLogInterval = time.Hour             // GPU 건너뜀이 이어지는 동안 로그 간격
+
+// noteGPUSkipped — 건너뜀을 센다. 로그는 건너뜀이 시작될 때 1줄, 이어지는 동안 앞 줄로부터 1시간마다 1줄(수집기의 단조 시계).
+func (collector *ResourceCollector) noteGPUSkipped() {
+	collector.mutex.Lock()
+	collector.stats.GPUSkipped++
+	collector.mutex.Unlock()
+	now := collector.monotonicNow()
+	collector.gpuSkipStreak++
+	if collector.gpuSkipStreak == 1 {
+		collector.gpuSkipStartedAt, collector.gpuSkipLoggedAt = now, now
+		collector.logf(fmt.Sprintf("resource metrics gpu query skipped: previous nvidia-smi exec in %s is still running or unknown (further skips are counted)",
+			collector.settings.GPUContainer), "warning")
+		return
+	}
+	if now-collector.gpuSkipLoggedAt >= gpuStuckLogInterval {
+		collector.gpuSkipLoggedAt = now
+		collector.logf(fmt.Sprintf("resource metrics gpu query still skipped: %d collections over %s (previous nvidia-smi exec in %s)",
+			collector.gpuSkipStreak, (now-collector.gpuSkipStartedAt).Round(time.Second), collector.settings.GPUContainer), "warning")
+	}
+}
+
+// noteGPUResumed — 남은 실행이 끝난(사라진) 것을 확인했다. 건너뜀이 이어지던 중이면 1줄.
+func (collector *ResourceCollector) noteGPUResumed() {
+	if collector.gpuSkipStreak == 0 {
+		return
+	}
+	collector.logf(fmt.Sprintf("resource metrics gpu query resumed after %d skipped collections over %s",
+		collector.gpuSkipStreak, (collector.monotonicNow()-collector.gpuSkipStartedAt).Round(time.Second)), "info")
+	collector.gpuSkipStreak = 0
 }
 
 // parseGPUQuery — 줄마다 "번호, 사용률, 메모리 사용(MiB), 메모리 전체(MiB), 온도". 출력 글자는 오류에 싣지 않는다.

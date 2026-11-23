@@ -97,6 +97,9 @@ func (docker *dockerAPI) request(ctx context.Context, method, path string, body 
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 		response.Body.Close()
+		if response.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("docker %s %s: %w", method, strings.SplitN(path, "?", 2)[0], errDockerNotFound)
+		}
 		return nil, fmt.Errorf("docker %s %s: status %d", method, strings.SplitN(path, "?", 2)[0], response.StatusCode)
 	}
 	return response, nil
@@ -133,39 +136,50 @@ func (docker *dockerAPI) containerStats(ctx context.Context, id string) (dockerC
 	return stats, err
 }
 
-// execQuery — 컨테이너 안에서 command 를 Tty 없이 실행해 stdout 과 종료 코드를 돌려준다(stderr 는 버린다).
-func (docker *dockerAPI) execQuery(ctx context.Context, containerName string, command []string) (string, int, error) {
+// errDockerNotFound — 도커가 404 로 답했다(그 컨테이너 · 실행이 없다).
+var errDockerNotFound = errors.New("docker: not found")
+
+// createExec — 컨테이너 안에 command 를 Tty 없이 실행할 실행을 만든다(아직 시작하지 않는다). 실행 ID 를 돌려준다.
+func (docker *dockerAPI) createExec(ctx context.Context, containerName string, command []string) (string, error) {
 	var created struct {
 		ID string `json:"Id"`
 	}
 	createBody := map[string]any{"AttachStdout": true, "AttachStderr": true, "Tty": false, "Cmd": command}
 	if err := docker.decode(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerName)+"/exec", createBody, &created); err != nil {
-		return "", 0, err
+		return "", err
 	}
 	if created.ID == "" {
-		return "", 0, errors.New("docker exec: empty id")
+		return "", errors.New("docker exec: empty id")
 	}
-	execPath := "/exec/" + url.PathEscape(created.ID)
-	response, err := docker.request(ctx, http.MethodPost, execPath+"/start", map[string]any{"Detach": false, "Tty": false})
+	return created.ID, nil
+}
+
+// startExec — 실행을 시작하고 출력이 끝날 때까지 stdout 을 읽는다(stderr 는 버린다).
+func (docker *dockerAPI) startExec(ctx context.Context, id string) (string, error) {
+	response, err := docker.request(ctx, http.MethodPost, "/exec/"+url.PathEscape(id)+"/start", map[string]any{"Detach": false, "Tty": false})
 	if err != nil {
-		return "", 0, err
+		return "", err
 	}
-	output, err := readMultiplexedStdout(response.Body, dockerExecOutputLimit)
-	response.Body.Close()
-	if err != nil {
-		return "", 0, err
-	}
+	defer response.Body.Close()
+	return readMultiplexedStdout(response.Body, dockerExecOutputLimit)
+}
+
+// inspectExec — 실행의 상태. 끝났으면 running=false 와 종료 코드. 실행이 없으면 errDockerNotFound.
+func (docker *dockerAPI) inspectExec(ctx context.Context, id string) (running bool, exitCode int, err error) {
 	var inspect struct {
 		Running  bool `json:"Running"`
-		ExitCode int  `json:"ExitCode"`
+		ExitCode *int `json:"ExitCode"`
 	}
-	if err := docker.decode(ctx, http.MethodGet, execPath+"/json", nil, &inspect); err != nil {
-		return "", 0, err
+	if err := docker.decode(ctx, http.MethodGet, "/exec/"+url.PathEscape(id)+"/json", nil, &inspect); err != nil {
+		return false, 0, err
 	}
 	if inspect.Running {
-		return "", 0, errors.New("docker exec: still running after output ended")
+		return true, 0, nil
 	}
-	return output, inspect.ExitCode, nil
+	if inspect.ExitCode == nil {
+		return false, 0, errors.New("docker exec: finished without exit code")
+	}
+	return false, *inspect.ExitCode, nil
 }
 
 // readMultiplexedStdout — 다중화된 흐름(조각마다 8바이트 머리 [흐름, 0, 0, 0, 길이(빅엔디언 4바이트)] + 내용)에서 stdout(1)만 잇는다.
