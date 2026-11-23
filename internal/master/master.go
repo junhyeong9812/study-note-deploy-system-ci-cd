@@ -50,13 +50,14 @@ type Master struct {
 	unrecorded         map[string]Deployment
 	busyRetryInterval  time.Duration
 	storeRetryInterval time.Duration
+	gitRelayTimeout    time.Duration // git 조회 중계(git_relay.go)의 agent 호출 기한 — 테스트가 줄인다
 }
 
 // New — 이력 DB를 열고, 지난 실행에서 끝나지 못한 건을 실패로 닫는다. DB를 못 열면 뜨지 않는다(fail-closed).
 func New(logger *shared.Logger) (*Master, error) {
 	agents := map[string]string{}
 	// AGENT_URL_FRONT=http://<host>:15001 형식 — 서비스 allowlist는 이 고정 열거가 정본
-	for _, service := range []string{"front", "backend", "llm", "alert", "observe"} {
+	for _, service := range []string{"front", "backend", "llm", "alert", "observe", "admin"} {
 		if agentURL := os.Getenv("AGENT_URL_" + strings.ToUpper(service)); agentURL != "" {
 			agents[service] = agentURL
 		}
@@ -72,7 +73,7 @@ func New(logger *shared.Logger) (*Master, error) {
 	master := &Master{secret: os.Getenv("DEPLOY_SECRET"), logger: logger, agents: agents,
 		store: store, inFlight: map[string]bool{}, unrecorded: map[string]Deployment{},
 		alerts:            shared.NewAlertSender("ci-cd", logger),
-		busyRetryInterval: 15 * time.Second, storeRetryInterval: 30 * time.Second}
+		busyRetryInterval: 15 * time.Second, storeRetryInterval: 30 * time.Second, gitRelayTimeout: gitRelayTimeout}
 	closed, err := store.FailUnfinished(StageInterrupted, "master가 진행 중에 재시작됨", now())
 	if err != nil {
 		return nil, fmt.Errorf("미완료 건 정리 실패: %w", err)
@@ -94,6 +95,8 @@ func (master *Master) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /deploys/{requestID}", master.handleDeployment)
 	mux.HandleFunc("GET /deploys", master.handleDeployments)
 	mux.HandleFunc("GET /status", master.handleStatus)
+	mux.HandleFunc("GET /deploys/git/commits", master.handleGitCommits)
+	mux.HandleFunc("GET /deploys/git/commit", master.handleGitCommit)
 }
 
 func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Request) {
