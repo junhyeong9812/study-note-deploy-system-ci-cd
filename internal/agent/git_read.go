@@ -104,6 +104,8 @@ const (
 	// gitReadTimeout(3초) + 이 값은 master 의 중계 기한(4초)보다 작아야 한다(git_timeout 과 agent_timeout 이 섞이지 않게 — 명세 12.9).
 	gitProcessWaitDelay       = 500 * time.Millisecond
 	gitCodeRepositoryChanging = "repository_changing" // 503 — 배포의 fetch 가 조회 도중 이력을 바꾸는 중
+	gitAuthorNameByteLimit    = 200                   // 작성자 이름 바이트 — 넘으면 글자 경계에서 자르고 gitNameCutMarker
+	gitNameCutMarker          = "…"
 )
 
 // 조회 실패의 갈래 — 응답 코드는 이것으로만 정한다. git 의 오류 글자는 읽지 않는다(지역 설정을 탄다 — 명세 12.5).
@@ -115,6 +117,7 @@ var (
 	errShallowListUnread   = errors.New("shallow 목록 읽기 실패")
 	errRepositoryChanging  = errors.New(gitCodeRepositoryChanging)
 	errGitOutputLimit      = errors.New("git 출력 상한")
+	errResponseTooLarge    = errors.New("줄일 것을 다 줄여도 응답이 2MB 초과") // 마지막 방어 — git_failed 로 답한다
 )
 
 // gitRead — 조회 하나의 본체. boundaries 는 그 조회 전체가 쓰는 하나의 얕은 경계 목록이다.
@@ -252,6 +255,9 @@ func readCommitRange(reader *gitReader, shas []string, boundaries map[string]boo
 	}
 	result.Commits = commits
 	limitRangeSize(&result)
+	if encodedEnvelopeLength(result) > gitResponseByteLimit { // 커밋을 다 빼고도 넘는다 — 그대로 내지 않는다
+		return nil, errResponseTooLarge
+	}
 	return result, nil
 }
 
@@ -360,6 +366,9 @@ func readCommitDetail(reader *gitReader, shas []string, boundaries map[string]bo
 	}
 	detail := GitCommitDetail{GitCommit: commits[0], Files: files, FilesTruncated: filesTruncated}
 	limitResponseSize(&detail)
+	if encodedEnvelopeLength(detail) > gitResponseByteLimit { // 파일을 다 빼고도 넘는다 — 그대로 내지 않는다
+		return nil, errResponseTooLarge
+	}
 	return detail, nil
 }
 
@@ -547,7 +556,12 @@ func parseCommits(output []byte, overflowed bool) ([]GitCommit, error) {
 		}
 		subject, _ := cutBytes(record[3], gitSubjectByteLimit)
 		body, bodyTruncated := cutBytes(record[4], gitBodyByteLimit)
-		commits = append(commits, GitCommit{Sha: record[0], AuthorName: record[1],
+		authorName, nameCut := cutBytes(record[1], gitAuthorNameByteLimit)
+		if nameCut {
+			authorName, _ = cutBytes(record[1], gitAuthorNameByteLimit-len(gitNameCutMarker))
+			authorName += gitNameCutMarker
+		}
+		commits = append(commits, GitCommit{Sha: record[0], AuthorName: authorName,
 			AuthoredAt: authoredAt.UTC().Format(time.RFC3339), Subject: subject, Body: body, BodyTruncated: bodyTruncated})
 	}
 	return commits, nil
