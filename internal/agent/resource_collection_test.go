@@ -492,3 +492,37 @@ func TestResourceMetricsDisabledLineCoversUnparsableAddress(t *testing.T) {
 		t.Fatalf("해석할 수 없는 주소를 비어 있음으로만 말한다: %q", line)
 	}
 }
+
+// §13: 빈 주소와 해석할 수 없는 주소에서 같은 줄 — 그 줄은 둘을 함께 말한다("empty" + 해석 불가류 낱말).
+func TestResourceMetricsDisabledLineIsSameForEmptyAndUnparsableAddress(t *testing.T) {
+	disabledMessage := func(rawURL string) string {
+		t.Setenv("LOG_REDIS_URL", "")
+		agent := newPipelineAgent(t, &recordedCommands{})
+		t.Setenv("LOG_REDIS_URL", rawURL)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var collector *ResourceCollector
+		output := strings.TrimSpace(captureStandardOutput(t, func() { collector = agent.StartResourceMetrics(ctx) }))
+		if collector != nil || output == "" || strings.Contains(output, "\n") {
+			t.Fatalf("%q: 시작하지 않고 1줄: %v %q", rawURL, collector != nil, output)
+		}
+		_, message, _ := strings.Cut(output, " ") // 앞의 시각을 뗀다
+		return strings.ToLower(message)
+	}
+	empty, unparsable := disabledMessage(""), disabledMessage("not-a-redis-address")
+	if empty != unparsable {
+		t.Fatalf("빈 주소와 해석할 수 없는 주소의 줄이 같아야 한다:\n%q\n%q", empty, unparsable)
+	}
+	if !strings.Contains(empty, "empty") {
+		t.Fatalf("줄에 비어 있음(empty)이 없다: %q", empty)
+	}
+	saysUnparsable := false
+	for _, word := range []string{"invalid", "unparsable", "unparseable", "parse", "해석", "잘못", "틀린"} {
+		if strings.Contains(empty, word) {
+			saysUnparsable = true
+		}
+	}
+	if !saysUnparsable {
+		t.Fatalf("줄에 해석 불가류 낱말이 없다: %q", empty)
+	}
+}

@@ -11,6 +11,7 @@ package agent
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/url"
 	"strings"
 	"testing"
@@ -87,14 +88,23 @@ func TestResourceGPUFailureMarksMissingButKeepsOtherParts(t *testing.T) {
 		{"숫자가 아닌 칸", "0, [N/A], 9, 8192, 28\n", 0, 0},
 		{"둘째 줄만 틀림", "0, 0, 9, 8192, 28\ngarbage\n", 0, 0},
 		{"출력 없음", "", 0, 0},
-		{"GPU 컨테이너가 꺼져 있음", "", 0, 409},
-		{"GPU 컨테이너가 없음", "", 0, 404},
+		{"GPU 컨테이너가 꺼져 있음(조회는 200 · Running:false)", "", 0, 409},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.situation, func(t *testing.T) {
 			harness := newGPUHarness(t, testCase.output, testCase.exitCode)
 			harness.docker.set(func(docker *fakeDocker) { docker.execCreateStatus = testCase.createStatus })
+			if testCase.createStatus == http.StatusConflict { // 꺼진 컨테이너 — 조회가 Running:false 로 온다(실측 · §13.2)
+				harness.docker.set(func(docker *fakeDocker) { docker.gpuContainerState = "exited" })
+			}
 			entry := harness.collect()
+			if testCase.createStatus == http.StatusConflict {
+				for _, request := range harness.docker.recorded() {
+					if request.method == http.MethodPost {
+						t.Fatalf("꺼진 컨테이너에는 아무것도 보내지 않는다: %s %s", request.method, request.path)
+					}
+				}
+			}
 			if gpus := listOf(t, entry, "gpus"); len(gpus) != 0 {
 				t.Fatalf("GPU 를 읽지 못하면 gpus 는 []: %v", gpus)
 			}

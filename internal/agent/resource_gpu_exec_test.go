@@ -395,3 +395,62 @@ func TestResourceNoGPUSettingLogsNothing(t *testing.T) {
 		t.Fatalf("GPU 설정이 없으면 GPU 결측 줄도 없다: %v", lines)
 	}
 }
+
+// ===== §13.2 — 돌고 있지 않은 컨테이너 · 인자 칸이 없는 같은 이름 =====
+
+func TestResourceGPUSendsNothingToContainerThatIsNotRunning(t *testing.T) {
+	for _, state := range []string{"exited", "paused", "restarting"} {
+		t.Run(state, func(t *testing.T) {
+			harness := newExecHarness(t)
+			harness.docker.set(func(docker *fakeDocker) {
+				docker.gpuContainerState = state
+				addOurExec(docker, "exec-left", "created") // 시작 안 된 우리 실행이 목록에 남아 있어도(일시정지에서 가능) 시작하지 않는다
+			})
+			for round := 1; round <= 2; round++ {
+				harness.clock.advance(30 * time.Second)
+				requireGPUMissingButOthersIntact(t, fmt.Sprintf("%s 컨테이너 %d", state, round), harness.collect())
+			}
+			if calls := gpuCalls(harness, 0); countCalls(calls, isPost) != 0 {
+				t.Fatalf("%s 컨테이너에 만들기 · 시작을 보냈다: %v", state, calls)
+			}
+			harness.docker.set(func(docker *fakeDocker) { docker.gpuContainerState = "" })
+			harness.clock.advance(30 * time.Second)
+			requireGPUValues(t, state+" 에서 돌아온 다음 수집", harness.collect())
+		})
+	}
+}
+
+func TestResourceGPUSameCommandWithoutArgumentsCannotBeJudged(t *testing.T) {
+	for _, shape := range []string{"no-arguments", "null-arguments"} {
+		t.Run(shape, func(t *testing.T) {
+			harness := newExecHarness(t)
+			harness.docker.set(func(docker *fakeDocker) {
+				docker.addExec("exec-unclear", "running", "nvidia-smi").processConfig = shape
+			})
+			requireGPUMissingButOthersIntact(t, "nvidia-smi 인데 인자 칸이 "+shape, harness.collect())
+			if calls := gpuCalls(harness, 0); countCalls(calls, isPost) != 0 {
+				t.Fatalf("같은 이름인데 인자를 알 수 없으면 만들지 않는다: %v", calls)
+			}
+		})
+	}
+}
+
+func TestResourceGPUOtherCommandWithoutArgumentsDoesNotBlock(t *testing.T) {
+	cases := map[string]func(docker *fakeDocker){
+		"sh · 인자 칸 없음": func(docker *fakeDocker) { docker.addExec("exec-shell", "running", "sh").processConfig = "no-arguments" },
+		"sh · 인자 null": func(docker *fakeDocker) {
+			docker.addExec("exec-shell", "running", "sh").processConfig = "null-arguments"
+		},
+		"nvidia-smi · 인자 []": func(docker *fakeDocker) { docker.addExec("exec-bare", "running", "nvidia-smi") }, // 인자 없음이 분명함 — 다른 명령
+	}
+	for situation, setup := range cases {
+		t.Run(situation, func(t *testing.T) {
+			harness := newExecHarness(t)
+			harness.docker.set(setup)
+			requireGPUValues(t, situation, harness.collect())
+			if creates := countCalls(gpuCalls(harness, 0), isCreate); creates != 1 {
+				t.Fatalf("다른 명령은 막지 않는다 — 새로 하나 만든다: %d", creates)
+			}
+		})
+	}
+}

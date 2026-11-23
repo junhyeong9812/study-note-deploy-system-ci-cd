@@ -338,6 +338,7 @@ type fakeDocker struct {
 	// --- GPU 용 실행(exec) — 도커 29.1 실측 꼴(§13) ---
 	gpuContainer        string               // GPU 컨테이너 이름(기본 "llm-ollama") — 조회하면 ExecIDs 를 준다
 	gpuContainerInspect string               // 그 컨테이너 조회의 동작: "" 정상 · "500" · "404" · "stall" · "drop"
+	gpuContainerState   string               // "" 도는 중 · "exited"(꺼짐) · "paused"(일시정지) · "restarting" — 조회는 200(실측)
 	execs               map[string]*fakeExec // 실행 ID → 실행
 	execOrder           []string             // 만든 순서
 	execCount           int                  // 만든 실행 수 — ID 는 exec-1, exec-2, …
@@ -476,9 +477,12 @@ func (docker *fakeDocker) serveList(writer http.ResponseWriter, request *http.Re
 func (docker *fakeDocker) serveInspect(writer http.ResponseWriter, request *http.Request, path, key string) {
 	docker.mutex.Lock()
 	if docker.gpuContainer != "" && key == docker.gpuContainer && docker.find(key) == nil {
-		behaviour := docker.gpuContainerInspect
+		behaviour, containerState := docker.gpuContainerInspect, docker.gpuContainerState
 		var execIDs []string // 실행이 없으면 null
 		for _, id := range docker.execOrder {
+			if containerState == "exited" {
+				break // 꺼진 컨테이너는 ExecIDs:null(실측)
+			}
 			if state := docker.execs[id].state; state == "created" || state == "running" { // 끝난 실행은 빠진다
 				execIDs = append(execIDs, id)
 			}
@@ -489,7 +493,7 @@ func (docker *fakeDocker) serveInspect(writer http.ResponseWriter, request *http
 		}
 		writeDockerJSON(writer, http.StatusOK, map[string]any{
 			"Id": containerID("99"), "Name": "/" + key, "RestartCount": 0, "ExecIDs": execIDs,
-			"State":  map[string]any{"Status": "running", "Running": true, "Pid": 4242},
+			"State":  gpuContainerStateBody(containerState),
 			"Config": map[string]any{"Env": []string{"OLLAMA_TOKEN=ENV_SECRET_VALUE"}, "Cmd": []string{"serve"}},
 		})
 		return
@@ -562,7 +566,7 @@ type fakeExec struct {
 	exitCode        int
 	settleRemaining int    // 끝난 뒤 Running:true 로 답할 남은 조회 수
 	inspect         string // 상태 조회의 동작: "" 정상 · "404" · "500" · "stall" · "drop"
-	processConfig   string // "" 정상 · "missing"(칸 없음) · "malformed"(꼴이 다름)
+	processConfig   string // "" 정상 · "missing"(칸 없음) · "malformed"(꼴이 다름) · "no-arguments"(인자 칸 없음) · "null-arguments"
 }
 
 // gpuQueryArguments — 고정 조회 명령의 인자(실행 조회의 ProcessConfig.arguments 꼴).
@@ -605,6 +609,11 @@ func (docker *fakeDocker) serveExecCreate(writer http.ResponseWriter, request *h
 		writeDockerJSON(writer, status, map[string]string{"message": "container " + key + " is not running"})
 		return
 	}
+	if state := docker.gpuContainerState; state != "" && key == docker.gpuContainer { // 돌고 있지 않은 컨테이너 — 409, 실행 기록 없음(실측)
+		docker.mutex.Unlock()
+		writeDockerJSON(writer, http.StatusConflict, map[string]string{"message": "container " + key + " is not running (" + state + ")"})
+		return
+	}
 	var create struct{ Cmd []string }
 	_ = json.Unmarshal(body, &create)
 	docker.execCount++
@@ -644,12 +653,20 @@ func (docker *fakeDocker) serveExecInspect(writer http.ResponseWriter, request *
 	case exec.state == "exited" && !running:
 		body["ExitCode"] = exec.exitCode
 	}
+	arguments := exec.arguments
+	if arguments == nil {
+		arguments = []string{} // 인자가 없는 명령에도 빈 배열(실측)
+	}
 	switch exec.processConfig {
+	case "no-arguments": // 인자 칸 자체가 없음
+		body["ProcessConfig"] = map[string]any{"tty": false, "entrypoint": exec.entrypoint, "privileged": false, "user": ""}
+	case "null-arguments":
+		body["ProcessConfig"] = map[string]any{"tty": false, "entrypoint": exec.entrypoint, "arguments": nil, "privileged": false, "user": ""}
 	case "missing":
 	case "malformed":
 		body["ProcessConfig"] = map[string]any{"entrypoint": 42, "arguments": "not-a-list"}
 	default:
-		body["ProcessConfig"] = map[string]any{"tty": false, "entrypoint": exec.entrypoint, "arguments": exec.arguments, "privileged": false, "user": ""}
+		body["ProcessConfig"] = map[string]any{"tty": false, "entrypoint": exec.entrypoint, "arguments": arguments, "privileged": false, "user": ""}
 	}
 	docker.mutex.Unlock()
 	if respondTrouble(writer, behaviour, func() { docker.stall(request, path) }) {
@@ -666,6 +683,11 @@ func (docker *fakeDocker) serveExecStart(writer http.ResponseWriter, request *ht
 	if exec == nil {
 		docker.mutex.Unlock()
 		writeDockerJSON(writer, http.StatusNotFound, map[string]string{"message": "No such exec instance: " + id})
+		return
+	}
+	if docker.gpuContainerState != "" { // 돌고 있지 않은 컨테이너의 실행은 시작되지 않는다(409)
+		docker.mutex.Unlock()
+		writeDockerJSON(writer, http.StatusConflict, map[string]string{"message": "container is not running"})
 		return
 	}
 	if docker.execStartStatus != 0 {
@@ -1033,4 +1055,17 @@ func findContainer(t *testing.T, containers []map[string]any, name string) map[s
 	}
 	t.Fatalf("컨테이너 %q 가 없다: %v", name, containers)
 	return nil
+}
+
+// gpuContainerStateBody — 컨테이너 조회의 State(도커 29.1 실측 꼴).
+func gpuContainerStateBody(state string) map[string]any {
+	switch state {
+	case "exited":
+		return map[string]any{"Status": "exited", "Running": false, "Paused": false, "Restarting": false, "Pid": 0, "ExitCode": 0}
+	case "paused":
+		return map[string]any{"Status": "paused", "Running": true, "Paused": true, "Restarting": false, "Pid": 4242}
+	case "restarting":
+		return map[string]any{"Status": "restarting", "Running": true, "Paused": false, "Restarting": true, "Pid": 4242}
+	}
+	return map[string]any{"Status": "running", "Running": true, "Paused": false, "Restarting": false, "Pid": 4242}
 }
