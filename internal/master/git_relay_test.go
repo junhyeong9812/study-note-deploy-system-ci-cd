@@ -419,3 +419,38 @@ func TestGitRelayPassesRepositoryChangingAndInvalidRequestThrough(t *testing.T) 
 		}
 	}
 }
+
+// master 의 4MB 읽기 상한을 필수 칸을 갖춘 응답으로 고정 — 기준: requirement-spec.md §12.10.
+// 상한 바로 아래는 본문 바이트 그대로 200, 위는 502 unexpected_response. 두 경로 모두.
+func TestGitRelayFourMegabyteLimitWithCompleteEnvelopes(t *testing.T) {
+	agent := newFakeGitAgent(t, "llm")
+	master := newTestMaster(t)
+	envelopeOfSize := func(prefix, suffix string, size int) string {
+		return prefix + strings.Repeat("p", size-len(prefix)-len(suffix)) + suffix
+	}
+	routes := []struct {
+		name, target, prefix, suffix string
+	}{
+		{"상세", relayCommitTarget("llm", relayToSha),
+			`{"success":true,"data":{"sha":"` + relayToSha + `","author_name":"a","authored_at":"2026-01-02T03:04:05Z","subject":"s","body":"`,
+			`","body_truncated":false,"files":[],"files_truncated":false}}`},
+		{"목록", relayCommitsTarget("llm", relayFromSha, relayToSha),
+			`{"success":true,"data":{"commits":[{"sha":"` + relayToSha + `","author_name":"a","authored_at":"2026-01-02T03:04:05Z","subject":"s","body":"`,
+			`","body_truncated":false}],"truncated":false,"range_complete":true,"relation":"ancestor"}}`},
+	}
+	for _, route := range routes {
+		under := envelopeOfSize(route.prefix, route.suffix, 4<<20-1<<10)
+		agent.respond(200, under)
+		recorder := relayGet(master, route.target)
+		if recorder.Code != 200 || recorder.Body.String() != under {
+			t.Fatalf("%s: 상한 바로 아래(4MB-1KB)는 본문 바이트 그대로 200 이어야 한다: %d %d바이트(보낸 %d)", route.name, recorder.Code, recorder.Body.Len(), len(under))
+		}
+		over := envelopeOfSize(route.prefix, route.suffix, 4<<20+1<<10)
+		agent.respond(200, over)
+		recorder = relayGet(master, route.target)
+		if recorder.Body.Len() > 1<<20 {
+			t.Fatalf("%s: 4MB 를 넘는 응답을 흘렸다: %d바이트", route.name, recorder.Body.Len())
+		}
+		requireRelayFailure(t, recorder, 502, "unexpected_response")
+	}
+}

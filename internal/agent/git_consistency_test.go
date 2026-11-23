@@ -172,3 +172,29 @@ func TestGitReadDeadlineCoversRetriesWhenBoundaryKeepsChangingSlowly(t *testing.
 		}
 	}
 }
+
+// 재시도를 포함한 기한 — 기준: requirement-spec.md §12.9·§12.10. 한 번 시도는 기한(1초) 안, 두 번이면 밖이 되도록
+// git 호출마다 0.12초를 쉬고 경계를 계속 바꾼다. 기한이 조회 하나 전체에 걸리면 두 번째 시도 도중 504 git_timeout.
+// 시도마다 기한을 새로 주면 두 시도가 다 끝나 503 repository_changing 이 된다(그러면 실패).
+func TestGitReadDeadlineSpansBothAttempts(t *testing.T) {
+	repository, shas := linearRepository(t, 6)
+	agent := newGitReadAgent(t, map[string]string{"llm": repository.directory})
+	agent.gitTimeout = time.Second
+	state := installHookedGit(t, agent, keepChangingHook(repository, shas[:4])+"; sleep 0.12")
+	startedAt := time.Now()
+	recorder := gitGet(agent, commitTarget("llm", shas[5]))
+	elapsed := time.Since(startedAt)
+	requireGitFailure(t, recorder, 504, "git_timeout")
+	if elapsed >= 1900*time.Millisecond { // 기한 1초 + 정리 몫(0.5초) + 여유
+		t.Fatalf("재시도까지 합친 조회가 기한을 넘겨 %v 걸렸다", elapsed)
+	}
+	boundaryReads := 0
+	for _, arguments := range hookedInvocations(t, state) {
+		if containsArgument(arguments, "rev-parse") && containsArgument(arguments, "--git-path") {
+			boundaryReads++
+		}
+	}
+	if boundaryReads < 2 {
+		t.Fatalf("재시도가 실제로 돌지 않았다(rev-parse --git-path 호출 %d번) — 받침의 시간 배분을 다시 확인", boundaryReads)
+	}
+}
