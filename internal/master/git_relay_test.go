@@ -363,3 +363,59 @@ func TestGitRelayReportsAgentUnauthorizedAsBadGateway(t *testing.T) {
 		requireRelayFailure(t, relayGet(master, target), 502, "agent_unauthorized")
 	}
 }
+
+// 200 이어도 data 가 그 경로의 필수 칸을 갖추지 않으면 502 unexpected_response — 기준: requirement-spec.md §12.9.
+func TestGitRelayRejectsSuccessEnvelopeWithoutRequiredFields(t *testing.T) {
+	agent := newFakeGitAgent(t, "llm")
+	master := newTestMaster(t)
+	commitsData := `{"commits":[],"truncated":false,"range_complete":true,"relation":"ancestor"}`
+	commitData := `{"sha":"` + relayToSha + `","author_name":"a","authored_at":"2026-01-02T03:04:05Z","subject":"s","body":"","body_truncated":false,"files":[],"files_truncated":false}`
+	commits := relayCommitsTarget("llm", relayFromSha, relayToSha)
+	commit := relayCommitTarget("llm", relayToSha)
+	for _, broken := range []struct{ name, target, body string }{
+		{"목록 data 없음", commits, `{"success":true}`},
+		{"목록 data 빈 객체", commits, `{"success":true,"data":{}}`},
+		{"목록 data 배열", commits, `{"success":true,"data":[]}`},
+		{"목록 commits 가 배열 아님", commits, `{"success":true,"data":{"commits":{},"truncated":false,"range_complete":true,"relation":"ancestor"}}`},
+		{"목록 relation 없음", commits, `{"success":true,"data":{"commits":[],"truncated":false,"range_complete":true}}`},
+		{"목록 relation 이 글자 아님", commits, `{"success":true,"data":{"commits":[],"truncated":false,"range_complete":true,"relation":1}}`},
+		{"목록 truncated 없음", commits, `{"success":true,"data":{"commits":[],"range_complete":true,"relation":"ancestor"}}`},
+		{"목록 range_complete 가 참거짓 아님", commits, `{"success":true,"data":{"commits":[],"truncated":false,"range_complete":"yes","relation":"ancestor"}}`},
+		{"상세 data 없음", commit, `{"success":true}`},
+		{"상세 data 빈 객체", commit, `{"success":true,"data":{}}`},
+		{"상세 data 배열", commit, `{"success":true,"data":[]}`},
+		{"상세 sha 없음", commit, `{"success":true,"data":{"files":[],"files_truncated":false}}`},
+		{"상세 files 가 배열 아님", commit, `{"success":true,"data":{"sha":"` + relayToSha + `","files":"x","files_truncated":false}}`},
+		{"상세 files_truncated 없음", commit, `{"success":true,"data":{"sha":"` + relayToSha + `","files":[]}}`},
+		{"목록 경로에 상세 data", commits, `{"success":true,"data":` + commitData + `}`},
+	} {
+		agent.respond(200, broken.body)
+		recorder := relayGet(master, broken.target)
+		if recorder.Code != 502 || !strings.Contains(recorder.Body.String(), `"unexpected_response"`) {
+			t.Fatalf("%s: 502 unexpected_response 여야 한다: %d %.300s", broken.name, recorder.Code, recorder.Body.String())
+		}
+	}
+	for target, data := range map[string]string{commits: commitsData, commit: commitData} {
+		body := `{"success":true,"data":` + data + `}`
+		agent.respond(200, body)
+		recorder := relayGet(master, target)
+		if recorder.Code != 200 || !reflect.DeepEqual(decodeJSON(t, recorder.Body.Bytes()), decodeJSON(t, []byte(body))) {
+			t.Fatalf("온전한 응답은 그대로 200 이어야 한다: %d %.300s", recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+// agent 의 503 repository_changing(§12.9)과 422 invalid_request 는 그대로 전달한다.
+func TestGitRelayPassesRepositoryChangingAndInvalidRequestThrough(t *testing.T) {
+	agent := newFakeGitAgent(t, "llm")
+	master := newTestMaster(t)
+	for _, failure := range []struct {
+		status int
+		code   string
+	}{{503, "repository_changing"}, {422, "invalid_request"}} {
+		agent.respond(failure.status, `{"success":false,"error":{"code":"`+failure.code+`"}}`)
+		for _, target := range []string{relayCommitsTarget("llm", relayFromSha, relayToSha), relayCommitTarget("llm", relayToSha)} {
+			requireRelayFailure(t, relayGet(master, target), failure.status, failure.code)
+		}
+	}
+}
