@@ -48,6 +48,10 @@ type Agent struct {
 	drainMutex        sync.Mutex
 	draining          map[string]chan struct{} // 서비스 → 진행 중인 정리(끝나면 닫힌다)
 	background        sync.WaitGroup
+
+	// git 조회(git_read.go) — 테스트가 바꾸는 이음매. gitProgram 은 실행할 git(기본 "git"), gitTimeout 은 조회 하나의 기한.
+	gitProgram string
+	gitTimeout time.Duration
 }
 
 func New(logger *shared.Logger) *Agent {
@@ -87,12 +91,15 @@ func New(logger *shared.Logger) *Agent {
 		probeSlot: probeSlot, notifyDrain: notifyDrain,
 		probeInterval: time.Second, probeBudget: 30 * time.Second,
 		drainPollInterval: 2 * time.Second, drainLimit: 3 * time.Minute, drainWaitMargin: 70 * time.Second, drainSettle: 2 * time.Second,
-		draining: map[string]chan struct{}{}, alerts: shared.NewAlertSender("ci-cd-agent", logger)}
+		draining: map[string]chan struct{}{}, alerts: shared.NewAlertSender("ci-cd-agent", logger),
+		gitProgram: "git", gitTimeout: gitReadTimeout}
 }
 
 func (agent *Agent) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /agent/ci", agent.handleStage("ci", agent.integrate))
 	mux.HandleFunc("POST /agent/cd", agent.handleStage("cd", agent.deliver))
+	mux.HandleFunc("GET /agent/git/commits", agent.handleGitCommits)
+	mux.HandleFunc("GET /agent/git/commit", agent.handleGitCommit)
 }
 
 // handleStage — CI·CD 공통 접수: 인증 → 서비스·sha 검증 → 한 번에 하나 → 실행 → 실패 단계를 코드로 응답.
