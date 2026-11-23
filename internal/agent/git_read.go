@@ -71,7 +71,7 @@ type GitCommitRange struct {
 	Commits       []GitCommit `json:"commits"`        // B 쪽이 먼저(--topo-order). 빈 경우에도 null 이 아닌 [].
 	Truncated     bool        `json:"truncated"`      // 100개를 넘었거나 출력 상한에 걸림
 	RangeComplete bool        `json:"range_complete"` // 목록에 얕은 경계 커밋이 들어 있지 않음
-	Relation      string      `json:"relation"`       // gitRelationAncestor | gitRelationNotAncestor
+	Relation      string      `json:"relation"`       // gitRelationAncestor | gitRelationNotAncestor | gitRelationUnknown
 }
 
 // GitFileChange — 커밋의 파일 하나(첫째 부모와의 차이).
@@ -98,6 +98,7 @@ const (
 	gitCommitFieldCount  = 5                                       // 위 형식의 칸 수 — -z 로 레코드마다 NUL 로 끝맺는다
 	gitLineCutMarker     = " …(잘림)"                                // patch 한 줄을 자른 자리
 	gitEnvelopeAllowance = 64                                      // 봉투({"data":…,"success":true}\n)가 data 에 더하는 바이트의 넉넉한 몫
+	gitRelationUnknown   = "unknown"                               // 이력이 얕은 경계에서 끊겨 알 수 없음 — 목록은 빈 배열, range_complete:false
 )
 
 // 조회 실패의 갈래 — 응답 코드는 이것으로만 정한다. git 의 오류 글자는 읽지 않는다(지역 설정을 탄다 — 명세 12.5).
@@ -210,13 +211,15 @@ func readCommitRange(reader *gitReader, shas []string) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	result := GitCommitRange{Commits: []GitCommit{}, RangeComplete: true, Relation: gitRelationAncestor}
-	ancestor, err := reader.isAncestor(from, to)
+	result := GitCommitRange{Commits: []GitCommit{}, RangeComplete: true}
+	result.Relation, err = reader.relation(from, to, boundaries)
 	if err != nil {
 		return nil, err
 	}
-	if !ancestor { // 되돌린 배포·갈라진 이력 — 목록을 만들지 않는다(어드민이 GitHub 비교로 넘긴다)
-		result.Relation = gitRelationNotAncestor
+	if result.Relation == gitRelationUnknown {
+		result.RangeComplete = false
+	}
+	if result.Relation != gitRelationAncestor { // 목록을 만들지 않는다(어드민이 GitHub 비교로 넘긴다)
 		return result, nil
 	}
 	output, overflowed, err := reader.run("log", "--topo-order", "--no-color", "--no-show-signature", "-z", gitCommitFormat,
@@ -239,7 +242,73 @@ func readCommitRange(reader *gitReader, shas []string) (any, error) {
 		}
 	}
 	result.Commits = commits
+	limitRangeSize(&result)
 	return result, nil
+}
+
+// relation — 명세 12.8 의 판정 순서. 얕은 이력에서는 A 객체가 남아 있어도 B 에서 A 까지의 이력이 경계에서 끊길 수 있어
+// merge-base 의 "조상 아님"만으로는 되돌림·갈라짐이라 말할 수 없다.
+//  1. A 가 B 의 조상 → ancestor
+//  2. B 의 조상 순회가 얕은 경계에 닿지 않는다(이력이 온전하다) → not_ancestor
+//  3. B 가 A 의 조상(확실한 되돌림) → not_ancestor
+//  4. 그 밖 → unknown
+func (reader *gitReader) relation(from, to string, boundaries map[string]bool) (string, error) {
+	ancestor, err := reader.isAncestor(from, to)
+	if err != nil || ancestor {
+		return gitRelationAncestor, err
+	}
+	reached, err := reader.reachesShallowBoundary(to, boundaries)
+	if err != nil {
+		return "", err
+	}
+	if !reached {
+		return gitRelationNotAncestor, nil
+	}
+	rolledBack, err := reader.isAncestor(to, from)
+	if err != nil {
+		return "", err
+	}
+	if rolledBack {
+		return gitRelationNotAncestor, nil
+	}
+	return gitRelationUnknown, nil
+}
+
+// reachesShallowBoundary — sha 의 조상(자기 포함) 가운데 얕은 경계 커밋이 있는가. 얕지 않은 저장소면 닿을 경계가 없다.
+// 순회 출력이 상한에 걸리면 끝까지 보지 못한 것이므로 "닿았다"로 본다(조상 아님을 단정하지 않는 쪽).
+func (reader *gitReader) reachesShallowBoundary(sha string, boundaries map[string]bool) (bool, error) {
+	if len(boundaries) == 0 {
+		return false, nil
+	}
+	output, overflowed, err := reader.run("rev-list", "--end-of-options", sha)
+	if err != nil {
+		return false, err
+	}
+	if overflowed {
+		return true, nil
+	}
+	for _, ancestor := range strings.Fields(string(output)) {
+		if boundaries[ancestor] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// limitRangeSize — 커밋 목록의 최종 JSON(봉투 포함)이 gitResponseByteLimit 를 넘으면 뒤(오래된) 커밋부터 빼고 truncated.
+func limitRangeSize(result *GitCommitRange) {
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return
+	}
+	size := len(encoded) + gitEnvelopeAllowance
+	for len(result.Commits) > 0 && size > gitResponseByteLimit {
+		last := len(result.Commits) - 1
+		encodedCommit, _ := json.Marshal(result.Commits[last])
+		size -= len(encodedCommit) + len(",")
+		result.Commits = result.Commits[:last]
+		result.Truncated = true
+	}
 }
 
 // readCommitDetail — 커밋 하나와 그 첫째 부모와의 차이. 얕은 경계 커밋은 부모가 없어 틀린 diff 가 되므로 답하지 않는다.
@@ -300,7 +369,7 @@ func gitEnvironment() []string {
 // 상한을 넘으면 더 읽지 않고 프로세스를 끝낸 뒤 overflowed=true — 오류가 아니다, 호출한 쪽이 온전한 레코드까지만 쓴다.
 // 기한이 지나면 CommandContext 가 자식을 죽이고 Wait 가 끝날 때까지 기다린다(좀비를 남기지 않는다).
 func (reader *gitReader) run(subcommand string, arguments ...string) (output []byte, overflowed bool, err error) {
-	command := exec.CommandContext(reader.ctx, reader.program, append([]string{"--no-pager", subcommand}, arguments...)...)
+	command := exec.CommandContext(reader.ctx, reader.program, append([]string{"--no-pager", "-c", "core.quotePath=true", subcommand}, arguments...)...)
 	command.Dir = reader.directory
 	command.Env = gitEnvironment()
 	command.WaitDelay = time.Second // 자식이 물려준 파이프를 누가 쥐고 있어도 Wait 가 끝나게
@@ -421,7 +490,7 @@ func parseCommits(output []byte, overflowed bool) ([]GitCommit, error) {
 // 병합 커밋은 첫째 부모와의 차이, 이름 바꾸기 탐지는 -M 고정, 외부 diff·textconv·색 없음.
 func diffArguments(sha string, outputOptions ...string) []string {
 	arguments := []string{"--format=", "--no-color", "--no-ext-diff", "--no-textconv", "--no-show-signature",
-		"-M", "--diff-merges=first-parent"}
+		"-M", "--diff-merges=first-parent", "--src-prefix=a/", "--dst-prefix=b/"}
 	arguments = append(arguments, outputOptions...)
 	return append(arguments, "--end-of-options", sha)
 }
@@ -430,6 +499,7 @@ type rawFileEntry struct {
 	status       string
 	path         string
 	previousPath *string
+	typeChanged  bool // 파일↔심볼릭 링크 — patch 는 같은 머리줄의 두 조각으로 나온다
 }
 
 type fileLineCount struct {
@@ -437,8 +507,16 @@ type fileLineCount struct {
 	binary               bool
 }
 
-// fileChanges — 파일 경로·상태는 --raw -z 에서, 줄 수는 --numstat -z 에서, patch 는 --patch 에서 읽어 순서대로 짝짓는다.
-// 경로는 patch 머리줄에서 파싱하지 않는다(탭·줄바꿈·따옴표가 든 경로).
+// patchSection — patch 출력의 파일 한 조각: `diff --git ` 머리줄과 첫 `@@` 부터의 내용.
+type patchSection struct {
+	header string
+	hunks  string
+}
+
+// fileChanges — 파일 경로·상태는 --raw -z 에서, 줄 수는 --numstat -z 에서, patch 는 --patch 에서 읽는다.
+// 경로는 patch 머리줄에서 파싱하지 않는다(탭·줄바꿈·따옴표가 든 경로). 파일 목록(raw·numstat)과 patch 는 따로 지킨다:
+// 목록을 온전히 읽었으면 patch 출력이 상한에 걸려도 목록은 싣고, patch 를 온전히 읽지 못했거나 짝을 확정하지 못한 파일만
+// patch 를 비우고 patch_truncated. files_truncated 는 목록 자체가 잘렸을 때(100개 초과 · 목록 출력 상한)만.
 func (reader *gitReader) fileChanges(sha string) ([]GitFileChange, bool, error) {
 	rawOutput, rawOverflowed, err := reader.run("show", diffArguments(sha, "-z", "--raw")...)
 	if err != nil {
@@ -456,33 +534,97 @@ func (reader *gitReader) fileChanges(sha string) ([]GitFileChange, bool, error) 
 	if err != nil {
 		return nil, false, err
 	}
+	listOverflowed := rawOverflowed || numstatOverflowed
+	if !listOverflowed && len(entries) != len(counts) {
+		return nil, false, errUnexpectedGitOutput
+	}
+	fileCount := min(len(entries), len(counts))
+	filesTruncated := listOverflowed // 목록이 상한에서 잘렸으면 온전히 읽은 파일까지만 싣는다
+	if fileCount > gitFileLimit {
+		fileCount, filesTruncated = gitFileLimit, true
+	}
 	patchOutput, patchOverflowed, err := reader.run("show", diffArguments(sha, "--patch")...)
 	if err != nil {
 		return nil, false, err
 	}
-	patches := splitPatchSections(patchOutput, patchOverflowed)
+	sections := splitPatchSections(patchOutput, patchOverflowed)
 
-	overflowed := rawOverflowed || numstatOverflowed || patchOverflowed
-	if !overflowed && (len(entries) != len(counts) || len(entries) != len(patches)) {
-		return nil, false, errUnexpectedGitOutput
-	}
-	fileCount := min(len(entries), len(counts), len(patches))
-	filesTruncated := overflowed // 상한에서 잘렸으면 온전히 읽은 파일까지만 싣는다
-	if fileCount > gitFileLimit {
-		fileCount, filesTruncated = gitFileLimit, true
-	}
 	files := make([]GitFileChange, 0, fileCount)
+	next := 0 // 아직 짝짓지 않은 첫 조각
 	for index := 0; index < fileCount; index++ {
 		entry, count := entries[index], counts[index]
 		file := GitFileChange{Path: entry.path, PreviousPath: entry.previousPath, Status: entry.status,
 			Additions: count.additions, Deletions: count.deletions, Binary: count.binary}
-		if !count.binary {
-			patch, patchTruncated := limitPatch(patches[index])
+		hunks, consumed := pairPatch(entry, sections[next:])
+		next += consumed
+		switch {
+		case count.binary:
+		case consumed == 0: // 온전히 읽지 못했거나 짝을 확정하지 못했다 — 순서로 밀어 맞추지 않는다
+			emptied := ""
+			file.Patch, file.PatchTruncated = &emptied, true
+		default:
+			patch, patchTruncated := limitPatch(hunks)
 			file.Patch, file.PatchTruncated = &patch, patchTruncated
 		}
 		files = append(files, file)
 	}
 	return files, filesTruncated, nil
+}
+
+// pairPatch — 파일의 머리줄(경로로 만든 `diff --git a/… b/…`)과 같은 조각을 앞에서부터 짝짓는다.
+// 형 바뀜은 같은 머리줄의 조각 둘을 이어 붙인다. 앞 조각의 머리줄이 다르면 짝이 없는 것으로 보고 조각을 쓰지 않는다(consumed=0).
+func pairPatch(entry rawFileEntry, sections []patchSection) (hunks string, consumed int) {
+	wanted := 1
+	if entry.typeChanged {
+		wanted = 2
+	}
+	if len(sections) < wanted {
+		return "", 0
+	}
+	previousPath := entry.path
+	if entry.previousPath != nil {
+		previousPath = *entry.previousPath
+	}
+	header := "diff --git " + quoteGitPath("a/"+previousPath) + " " + quoteGitPath("b/"+entry.path)
+	var builder strings.Builder
+	for _, section := range sections[:wanted] {
+		if section.header != header {
+			return "", 0
+		}
+		builder.WriteString(section.hunks)
+	}
+	return builder.String(), wanted
+}
+
+// quoteGitPath — git 이 patch 머리줄에 경로를 쓰는 방식(core.quotePath=true 의 C 따옴표)을 그대로 흉내 낸다.
+// 큰따옴표·역슬래시·제어 문자·0x7f·0x80 이상이 있으면 전체를 따옴표로 감싸고 바이트를 이스케이프한다.
+func quoteGitPath(path string) string {
+	named := map[byte]string{'\a': `\a`, '\b': `\b`, '\t': `\t`, '\n': `\n`, '\v': `\v`, '\f': `\f`, '\r': `\r`, '"': `\"`, '\\': `\\`}
+	needsQuote := false
+	for index := 0; index < len(path); index++ {
+		character := path[index]
+		if character < 0x20 || character == '"' || character == '\\' || character >= 0x7f {
+			needsQuote = true
+			break
+		}
+	}
+	if !needsQuote {
+		return path
+	}
+	var builder strings.Builder
+	builder.WriteByte('"')
+	for index := 0; index < len(path); index++ {
+		character := path[index]
+		if escaped, found := named[character]; found {
+			builder.WriteString(escaped)
+		} else if character < 0x20 || character >= 0x7f {
+			builder.WriteString(fmt.Sprintf("\\%03o", character))
+		} else {
+			builder.WriteByte(character)
+		}
+	}
+	builder.WriteByte('"')
+	return builder.String()
 }
 
 // parseRawEntries — `:모드 모드 객체 객체 상태 NUL 경로 NUL [새 경로 NUL]` 의 나열.
@@ -506,7 +648,7 @@ func parseRawEntries(output []byte, overflowed bool) ([]rawFileEntry, error) {
 			}
 			return nil, errUnexpectedGitOutput
 		}
-		entry := rawFileEntry{path: tokens[index+pathCount], status: gitFileStatusModified}
+		entry := rawFileEntry{path: tokens[index+pathCount], status: gitFileStatusModified, typeChanged: statusLetter == "T"}
 		switch statusLetter {
 		case "A", "C":
 			entry.status = gitFileStatusAdded
@@ -563,19 +705,25 @@ func parseNumstat(output []byte, overflowed bool) ([]fileLineCount, error) {
 	return counts, nil
 }
 
-// splitPatchSections — patch 출력을 파일마다(`diff --git ` 줄에서 시작) 나누고, 파일 머리줄을 빼고 첫 `@@` 부터만 남긴다.
-// 내용 줄은 언제나 ' '·'+'·'-'·'\' 로 시작하므로 `diff --git ` 으로 시작하는 줄은 파일 머리뿐이다.
-// 출력이 상한에서 잘렸으면 마지막 파일은 온전하다고 볼 수 없어 뺀다.
-func splitPatchSections(output []byte, overflowed bool) []string {
-	sections := []string{}
-	var current *strings.Builder
+// splitPatchSections — patch 출력을 조각마다(`diff --git ` 줄에서 시작) 나누고, 머리줄과 첫 `@@` 부터의 내용을 남긴다.
+// 내용 줄은 언제나 ' '·'+'·'-'·'\' 로 시작하므로 `diff --git ` 으로 시작하는 줄은 조각의 머리뿐이다.
+// 출력이 상한에서 잘렸으면 마지막 조각은 온전하다고 볼 수 없어 뺀다.
+func splitPatchSections(output []byte, overflowed bool) []patchSection {
+	sections := []patchSection{}
+	var current *patchSection
+	var hunks strings.Builder
 	inHunks := false
+	flush := func() {
+		if current != nil {
+			current.hunks = hunks.String()
+			sections = append(sections, *current)
+		}
+	}
 	for _, line := range strings.SplitAfter(string(output), "\n") {
 		if strings.HasPrefix(line, "diff --git ") {
-			if current != nil {
-				sections = append(sections, current.String())
-			}
-			current, inHunks = &strings.Builder{}, false
+			flush()
+			current, inHunks = &patchSection{header: strings.TrimSuffix(line, "\n")}, false
+			hunks.Reset()
 			continue
 		}
 		if current == nil {
@@ -585,11 +733,9 @@ func splitPatchSections(output []byte, overflowed bool) []string {
 			continue
 		}
 		inHunks = true
-		current.WriteString(line)
+		hunks.WriteString(line)
 	}
-	if current != nil {
-		sections = append(sections, current.String())
-	}
+	flush()
 	if overflowed && len(sections) > 0 {
 		sections = sections[:len(sections)-1]
 	}
@@ -622,7 +768,8 @@ func limitPatch(patch string) (string, bool) {
 	return builder.String(), truncated
 }
 
-// limitResponseSize — 최종 JSON 이 gitResponseByteLimit 를 넘으면 뒤 파일부터 patch 를 비우고 patch_truncated 로 알린다.
+// limitResponseSize — 최종 JSON(봉투 포함)이 gitResponseByteLimit 를 넘으면 뒤 파일부터 patch 를 비우고 patch_truncated.
+// patch 를 다 비우고도 넘으면(경로만으로 큰 경우) 뒤 파일부터 빼고 files_truncated.
 func limitResponseSize(detail *GitCommitDetail) {
 	encoded, err := json.Marshal(detail)
 	if err != nil {
@@ -638,6 +785,13 @@ func limitResponseSize(detail *GitCommitDetail) {
 		size -= len(encodedPatch) - len(`""`)
 		emptied := ""
 		file.Patch, file.PatchTruncated = &emptied, true
+	}
+	for len(detail.Files) > 0 && size > gitResponseByteLimit {
+		last := len(detail.Files) - 1
+		encodedFile, _ := json.Marshal(detail.Files[last])
+		size -= len(encodedFile) + len(",")
+		detail.Files = detail.Files[:last]
+		detail.FilesTruncated = true
 	}
 }
 

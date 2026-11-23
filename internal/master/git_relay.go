@@ -10,6 +10,7 @@ package master
 // 칸 없음 · 칸 중복; 이때 agent 를 부르지 않는다) → agent 호출(GET, X-Deploy-Secret, 검사한 쿼리 그대로).
 // agent 의 응답은 상태·봉투 그대로 전달한다. 중계 자체의 실패:
 //   502 agent_unreachable · 504 agent_timeout(Master.gitRelayTimeout) · 502 unexpected_response(봉투 아님 · 4MB 초과).
+//   agent 의 401 만은 그대로 전달하지 않고 502 agent_unauthorized(명세 12.8).
 
 import (
 	"encoding/json"
@@ -30,6 +31,7 @@ const (
 
 	StageAgentTimeout       = "agent_timeout"
 	StageUnexpectedResponse = "unexpected_response"
+	StageAgentUnauthorized  = "agent_unauthorized" // agent 가 401 — master 의 DEPLOY_SECRET 이 agent 와 다르다
 )
 
 // handleGitCommits — GET /deploys/git/commits.
@@ -95,6 +97,10 @@ func (master *Master) relayGitRead(writer http.ResponseWriter, request *http.Req
 	}
 	if len(responseBody) > gitRelayResponseLimit || !isAgentEnvelope(response.StatusCode, responseBody) {
 		master.relayFailed(writer, requestID, service, agentPath, http.StatusBadGateway, StageUnexpectedResponse)
+		return
+	}
+	if response.StatusCode == http.StatusUnauthorized { // master 와 agent 의 비밀값 불일치(설정 실수) — 호출한 쪽의 401 과 구분한다
+		master.relayFailed(writer, requestID, service, agentPath, http.StatusBadGateway, StageAgentUnauthorized)
 		return
 	}
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
