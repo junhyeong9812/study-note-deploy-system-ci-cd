@@ -465,3 +465,30 @@ func TestResourceMetricsStartsWithRedisAddress(t *testing.T) {
 		t.Fatalf("첫 수집은 한 주기 뒤: %+v", stats)
 	}
 }
+
+// §13: 주소가 비었거나 해석할 수 없어 수집을 끄는 줄은 그 둘을 함께 말한다 — 해석할 수 없는 값을 "비어 있음"으로만 말하지 않는다.
+func TestResourceMetricsDisabledLineCoversUnparsableAddress(t *testing.T) {
+	disabledLine := func(rawURL string) string {
+		t.Setenv("LOG_REDIS_URL", "")
+		agent := newPipelineAgent(t, &recordedCommands{})
+		t.Setenv("LOG_REDIS_URL", rawURL)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var collector *ResourceCollector
+		output := strings.TrimSpace(captureStandardOutput(t, func() { collector = agent.StartResourceMetrics(ctx) }))
+		if collector != nil || output == "" || strings.Contains(output, "\n") {
+			t.Fatalf("%q: 시작하지 않고 1줄: %v %q", rawURL, collector != nil, output)
+		}
+		return strings.ToLower(output)
+	}
+	line := disabledLine("not-a-redis-address")
+	saysUnparsable := false
+	for _, word := range []string{"invalid", "unparsable", "unparseable", "parse", "해석", "잘못", "틀린"} {
+		if strings.Contains(line, word) {
+			saysUnparsable = true
+		}
+	}
+	if !saysUnparsable {
+		t.Fatalf("해석할 수 없는 주소를 비어 있음으로만 말한다: %q", line)
+	}
+}

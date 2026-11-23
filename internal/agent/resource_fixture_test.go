@@ -335,21 +335,26 @@ type fakeDocker struct {
 	execCreateStatus int
 	gpuOutput        string
 	gpuExitCode      int
-	execStartStatus  int // 0 이 아니면 exec 시작이 이 상태로 실패(만들기는 성공 — ID 는 이미 있다)
-	execRunningCount int // 실행마다 처음 이만큼의 상태 조회는 Running:true(도커의 종료 처리가 출력 닫힘보다 늦음)
-	// 실행 ID → 그 실행의 상태 조회 동작. "running"(끝내 Running:true) · "404"(사라짐) · "500" · "drop"(연결 끊김) · "stall"(멈춤)
-	execInspectBehaviour map[string]string
-	execCount            int            // 만든 실행 수 — ID 는 exec-1, exec-2, …
-	execInspections      map[string]int // 실행 ID → 상태 조회 횟수
-	requests             []dockerRequest
-	releases             chan stallRelease
-	server               *httptest.Server
+	// --- GPU 용 실행(exec) — 도커 29.1 실측 꼴(§13) ---
+	gpuContainer        string               // GPU 컨테이너 이름(기본 "llm-ollama") — 조회하면 ExecIDs 를 준다
+	gpuContainerInspect string               // 그 컨테이너 조회의 동작: "" 정상 · "500" · "404" · "stall" · "drop"
+	execs               map[string]*fakeExec // 실행 ID → 실행
+	execOrder           []string             // 만든 순서
+	execCount           int                  // 만든 실행 수 — ID 는 exec-1, exec-2, …
+	execStartStatus     int                  // 0 이 아니면 시작이 이 상태로 실패(실행은 시작 안 함으로 남는다)
+	holdCreateResponse  bool                 // 실행을 만들고 응답은 부른 쪽이 끊을 때까지 보류(만들기 응답 유실)
+	execRunningCount    int                  // 출력이 끝난 뒤 처음 이만큼의 상태 조회는 Running:true(종료 처리가 늦음)
+	execStayRunning     bool                 // 출력이 끝난 뒤에도 끝내 Running:true
+	slowStart           time.Duration        // 0 이 아니면 명령이 이만큼(실제 시간) 걸린 뒤 끝난다 — 부른 쪽이 먼저 끊어도 끝난다
+	requests            []dockerRequest
+	releases            chan stallRelease
+	server              *httptest.Server
 }
 
 var dockerVersionPrefix = regexp.MustCompile(`^/v[0-9]+\.[0-9]+`)
 
 func newFakeDocker(t *testing.T) *fakeDocker {
-	docker := &fakeDocker{releases: make(chan stallRelease, 64), execInspectBehaviour: map[string]string{}, execInspections: map[string]int{}}
+	docker := &fakeDocker{releases: make(chan stallRelease, 64), gpuContainer: "llm-ollama", execs: map[string]*fakeExec{}}
 	docker.server = httptest.NewServer(http.HandlerFunc(docker.serve))
 	t.Cleanup(docker.server.Close)
 	return docker
@@ -420,13 +425,13 @@ func (docker *fakeDocker) serve(writer http.ResponseWriter, request *http.Reques
 	case request.Method == http.MethodGet && path == "/containers/json":
 		docker.serveList(writer, request, path)
 	case request.Method == http.MethodGet && dockerInspectPath.MatchString(path):
-		docker.serveInspect(writer, dockerInspectPath.FindStringSubmatch(path)[1])
+		docker.serveInspect(writer, request, path, dockerInspectPath.FindStringSubmatch(path)[1])
 	case request.Method == http.MethodGet && dockerStatsPath.MatchString(path):
 		docker.serveStats(writer, request, path, dockerStatsPath.FindStringSubmatch(path)[1])
 	case request.Method == http.MethodPost && dockerExecCreatePath.MatchString(path):
-		docker.serveExecCreate(writer, dockerExecCreatePath.FindStringSubmatch(path)[1])
+		docker.serveExecCreate(writer, request, path, body, dockerExecCreatePath.FindStringSubmatch(path)[1])
 	case request.Method == http.MethodPost && dockerExecStartPath.MatchString(path):
-		docker.serveExecStart(writer, request, path)
+		docker.serveExecStart(writer, request, path, dockerExecStartPath.FindStringSubmatch(path)[1])
 	case request.Method == http.MethodGet && dockerExecInspect.MatchString(path):
 		docker.serveExecInspect(writer, request, path, dockerExecInspect.FindStringSubmatch(path)[1])
 	default:
@@ -468,8 +473,27 @@ func (docker *fakeDocker) serveList(writer http.ResponseWriter, request *http.Re
 	writeDockerJSON(writer, http.StatusOK, items)
 }
 
-func (docker *fakeDocker) serveInspect(writer http.ResponseWriter, key string) {
+func (docker *fakeDocker) serveInspect(writer http.ResponseWriter, request *http.Request, path, key string) {
 	docker.mutex.Lock()
+	if docker.gpuContainer != "" && key == docker.gpuContainer && docker.find(key) == nil {
+		behaviour := docker.gpuContainerInspect
+		var execIDs []string // 실행이 없으면 null
+		for _, id := range docker.execOrder {
+			if state := docker.execs[id].state; state == "created" || state == "running" { // 끝난 실행은 빠진다
+				execIDs = append(execIDs, id)
+			}
+		}
+		docker.mutex.Unlock()
+		if respondTrouble(writer, behaviour, func() { docker.stall(request, path) }) {
+			return
+		}
+		writeDockerJSON(writer, http.StatusOK, map[string]any{
+			"Id": containerID("99"), "Name": "/" + key, "RestartCount": 0, "ExecIDs": execIDs,
+			"State":  map[string]any{"Status": "running", "Running": true, "Pid": 4242},
+			"Config": map[string]any{"Env": []string{"OLLAMA_TOKEN=ENV_SECRET_VALUE"}, "Cmd": []string{"serve"}},
+		})
+		return
+	}
 	defer docker.mutex.Unlock()
 	container := docker.find(key)
 	if container == nil {
@@ -529,71 +553,159 @@ func (docker *fakeDocker) serveStats(writer http.ResponseWriter, request *http.R
 	writeDockerJSON(writer, http.StatusOK, body)
 }
 
-func (docker *fakeDocker) serveExecCreate(writer http.ResponseWriter, key string) {
-	docker.mutex.Lock()
-	status := docker.execCreateStatus
-	docker.mutex.Unlock()
-	if status != 0 {
-		writeDockerJSON(writer, status, map[string]string{"message": "container " + key + " is not running"})
-		return
-	}
-	docker.mutex.Lock()
-	docker.execCount++
-	id := fmt.Sprintf("exec-%d", docker.execCount)
-	docker.mutex.Unlock()
-	writeDockerJSON(writer, http.StatusCreated, map[string]string{"Id": id})
+// fakeExec — 도커의 실행 하나. 상태는 created(시작 안 함) → running → exited.
+type fakeExec struct {
+	id              string
+	entrypoint      string
+	arguments       []string
+	state           string
+	exitCode        int
+	settleRemaining int    // 끝난 뒤 Running:true 로 답할 남은 조회 수
+	inspect         string // 상태 조회의 동작: "" 정상 · "404" · "500" · "stall" · "drop"
+	processConfig   string // "" 정상 · "missing"(칸 없음) · "malformed"(꼴이 다름)
 }
 
-// serveExecInspect — 실행의 상태. 동작은 execInspectBehaviour[id] · execRunningCount 로 정한다.
-func (docker *fakeDocker) serveExecInspect(writer http.ResponseWriter, request *http.Request, path, id string) {
-	docker.mutex.Lock()
-	docker.execInspections[id]++
-	inspections := docker.execInspections[id]
-	behaviour, exitCode, runningCount, known := docker.execInspectBehaviour[id], docker.gpuExitCode, docker.execRunningCount, id != "" && strings.HasPrefix(id, "exec-")
-	docker.mutex.Unlock()
+// gpuQueryArguments — 고정 조회 명령의 인자(실행 조회의 ProcessConfig.arguments 꼴).
+var gpuQueryArguments = []string{"--query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"}
+
+// addExec — 이미 있는 실행을 심는다(agent 재시작 · 사람이 연 셸 등). set 안에서 부른다.
+func (docker *fakeDocker) addExec(id, state, entrypoint string, arguments ...string) *fakeExec {
+	exec := &fakeExec{id: id, state: state, entrypoint: entrypoint, arguments: arguments}
+	docker.execs[id] = exec
+	docker.execOrder = append(docker.execOrder, id)
+	return exec
+}
+
+// respondTrouble — 조회의 고장 동작. 답했으면 true.
+func respondTrouble(writer http.ResponseWriter, behaviour string, stall func()) bool {
 	switch behaviour {
 	case "404":
-		writeDockerJSON(writer, http.StatusNotFound, map[string]string{"message": "No such exec instance: " + id})
-		return
+		writeDockerJSON(writer, http.StatusNotFound, map[string]string{"message": "No such container or exec instance"})
 	case "500":
-		writeDockerJSON(writer, http.StatusInternalServerError, map[string]string{"message": "fake exec inspect failure"})
-		return
+		writeDockerJSON(writer, http.StatusInternalServerError, map[string]string{"message": "fake failure"})
 	case "stall":
-		docker.stall(request, path)
-		return
+		stall()
 	case "drop":
 		if hijacker, ok := writer.(http.Hijacker); ok {
 			if connection, _, err := hijacker.Hijack(); err == nil {
 				connection.Close()
-				return
 			}
 		}
+	default:
+		return false
+	}
+	return true
+}
+
+func (docker *fakeDocker) serveExecCreate(writer http.ResponseWriter, request *http.Request, path string, body []byte, key string) {
+	docker.mutex.Lock()
+	status, hold := docker.execCreateStatus, docker.holdCreateResponse
+	if status != 0 {
+		docker.mutex.Unlock()
+		writeDockerJSON(writer, status, map[string]string{"message": "container " + key + " is not running"})
 		return
 	}
-	if !known {
+	var create struct{ Cmd []string }
+	_ = json.Unmarshal(body, &create)
+	docker.execCount++
+	id := fmt.Sprintf("exec-%d", docker.execCount)
+	exec := docker.addExec(id, "created", "", nil...)
+	if len(create.Cmd) > 0 {
+		exec.entrypoint, exec.arguments = create.Cmd[0], create.Cmd[1:]
+	}
+	docker.mutex.Unlock()
+	if hold { // 실행은 생겼지만 응답은 오지 않는다
+		docker.stall(request, path)
+		return
+	}
+	writeDockerJSON(writer, http.StatusCreated, map[string]string{"Id": id})
+}
+
+// serveExecInspect — 실행의 상태(도커 29.1 꼴). 시작 안 함 = Running:false · ExitCode:null · Pid:0.
+func (docker *fakeDocker) serveExecInspect(writer http.ResponseWriter, request *http.Request, path, id string) {
+	docker.mutex.Lock()
+	exec := docker.execs[id]
+	if exec == nil {
+		docker.mutex.Unlock()
 		writeDockerJSON(writer, http.StatusNotFound, map[string]string{"message": "No such exec instance: " + id})
 		return
 	}
-	running := behaviour == "running" || inspections <= runningCount
-	body := map[string]any{"ID": id, "Running": running, "ExitCode": exitCode, "Pid": 4343}
-	if running {
-		body["ExitCode"] = nil // 도는 중에는 종료 코드가 없다
+	behaviour := exec.inspect
+	running := exec.state == "running"
+	if exec.state == "exited" && exec.settleRemaining > 0 {
+		exec.settleRemaining--
+		running = true
+	}
+	body := map[string]any{"ID": id, "ContainerID": containerID("99"), "Running": running, "ExitCode": nil, "Pid": 4343,
+		"OpenStdout": true, "OpenStderr": true, "CanRemove": false}
+	switch {
+	case exec.state == "created":
+		body["Pid"] = 0
+	case exec.state == "exited" && !running:
+		body["ExitCode"] = exec.exitCode
+	}
+	switch exec.processConfig {
+	case "missing":
+	case "malformed":
+		body["ProcessConfig"] = map[string]any{"entrypoint": 42, "arguments": "not-a-list"}
+	default:
+		body["ProcessConfig"] = map[string]any{"tty": false, "entrypoint": exec.entrypoint, "arguments": exec.arguments, "privileged": false, "user": ""}
+	}
+	docker.mutex.Unlock()
+	if respondTrouble(writer, behaviour, func() { docker.stall(request, path) }) {
+		return
 	}
 	writeDockerJSON(writer, http.StatusOK, body)
 }
 
 // serveExecStart — Tty 없는 exec 의 출력은 다중화된 흐름이다: 조각마다 [흐름(1=stdout), 0, 0, 0, 길이(빅엔디언 4바이트)] + 내용.
-func (docker *fakeDocker) serveExecStart(writer http.ResponseWriter, request *http.Request, path string) {
+// 부른 쪽이 연결만 끊으면 실행은 Running:true 로 남는다(실측).
+func (docker *fakeDocker) serveExecStart(writer http.ResponseWriter, request *http.Request, path, id string) {
 	docker.mutex.Lock()
-	output, stall, startStatus := docker.gpuOutput, docker.stallExecStart, docker.execStartStatus
-	docker.mutex.Unlock()
-	if stall {
-		docker.stall(request, path)
+	exec := docker.execs[id]
+	if exec == nil {
+		docker.mutex.Unlock()
+		writeDockerJSON(writer, http.StatusNotFound, map[string]string{"message": "No such exec instance: " + id})
 		return
 	}
-	if startStatus != 0 {
-		writeDockerJSON(writer, startStatus, map[string]string{"message": "fake exec start failure"})
+	if docker.execStartStatus != 0 {
+		status := docker.execStartStatus
+		docker.mutex.Unlock()
+		writeDockerJSON(writer, status, map[string]string{"message": "fake exec start failure"})
 		return
+	}
+	if exec.state != "created" {
+		docker.mutex.Unlock()
+		writeDockerJSON(writer, http.StatusConflict, map[string]string{"message": "exec " + id + " has already been started"})
+		return
+	}
+	exec.state = "running"
+	output, stall, slow, stayRunning, runningCount, exitCode :=
+		docker.gpuOutput, docker.stallExecStart, docker.slowStart, docker.execStayRunning, docker.execRunningCount, docker.gpuExitCode
+	docker.mutex.Unlock()
+	finish := func() {
+		docker.mutex.Lock()
+		defer docker.mutex.Unlock()
+		if stayRunning {
+			return
+		}
+		exec.state, exec.exitCode, exec.settleRemaining = "exited", exitCode, runningCount
+	}
+	if stall {
+		docker.stall(request, path) // 끊긴 뒤에도 도는 중으로 남는다
+		return
+	}
+	if slow > 0 {
+		startedAt := time.Now()
+		select {
+		case <-request.Context().Done():
+			go func() { // 부른 쪽이 끊어도 명령은 끝까지 돈다
+				time.Sleep(slow - time.Since(startedAt))
+				finish()
+			}()
+			return
+		case <-time.After(slow):
+		}
 	}
 	writer.Header().Set("Content-Type", "application/vnd.docker.multiplexed-stream")
 	writer.WriteHeader(http.StatusOK)
@@ -603,6 +715,7 @@ func (docker *fakeDocker) serveExecStart(writer http.ResponseWriter, request *ht
 		binary.BigEndian.PutUint32(header[4:], uint32(len(piece)))
 		_, _ = writer.Write(append(header, piece...))
 	}
+	finish()
 }
 
 func splitInTwo(output string) []string {
