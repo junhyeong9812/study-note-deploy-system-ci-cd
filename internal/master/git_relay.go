@@ -36,17 +36,18 @@ const (
 
 // handleGitCommits — GET /deploys/git/commits.
 func (master *Master) handleGitCommits(writer http.ResponseWriter, request *http.Request) {
-	master.relayGitRead(writer, request, "/agent/git/commits", []string{"from", "to"})
+	master.relayGitRead(writer, request, "/agent/git/commits", []string{"from", "to"}, gitCommitsRequiredFields)
 }
 
 // handleGitCommit — GET /deploys/git/commit.
 func (master *Master) handleGitCommit(writer http.ResponseWriter, request *http.Request) {
-	master.relayGitRead(writer, request, "/agent/git/commit", []string{"sha"})
+	master.relayGitRead(writer, request, "/agent/git/commit", []string{"sha"}, gitCommitRequiredFields)
 }
 
 // relayGitRead — 비밀값 → 입력 검사(틀리면 agent 를 부르지 않는다) → 그 서비스의 agent 를 GET 으로 → 상태·봉투 그대로.
 // 배포 호출(callAgent — POST·16KB)과 따로 둔다: 읽기 상한(4MB)과 기한이 다르다.
-func (master *Master) relayGitRead(writer http.ResponseWriter, request *http.Request, agentPath string, shaFields []string) {
+func (master *Master) relayGitRead(writer http.ResponseWriter, request *http.Request, agentPath string, shaFields []string,
+	requiredFields map[string]jsonKind) {
 	if !shared.SecretMatches(request, master.secret) {
 		shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")
 		return
@@ -95,7 +96,7 @@ func (master *Master) relayGitRead(writer http.ResponseWriter, request *http.Req
 		}
 		return
 	}
-	if len(responseBody) > gitRelayResponseLimit || !isAgentEnvelope(response.StatusCode, responseBody) {
+	if len(responseBody) > gitRelayResponseLimit || !isAgentEnvelope(response.StatusCode, responseBody, requiredFields) {
 		master.relayFailed(writer, requestID, service, agentPath, http.StatusBadGateway, StageUnexpectedResponse)
 		return
 	}
@@ -113,21 +114,55 @@ func (master *Master) relayFailed(writer http.ResponseWriter, requestID, service
 	shared.WriteFail(writer, status, code, "")
 }
 
-// isAgentEnvelope — 성공은 200 + success:true, 실패는 4xx·5xx + success:false + 코드. 그 밖은 agent 의 봉투로 보지 않는다.
-func isAgentEnvelope(status int, body []byte) bool {
+// jsonKind — 성공 봉투의 data 에서 필수 칸이 가져야 할 JSON 형.
+type jsonKind int
+
+const (
+	jsonString jsonKind = iota
+	jsonBoolean
+	jsonArray
+)
+
+// 경로별 성공 data 의 필수 칸(명세 12.9) — 없거나 형이 다르면 agent 의 답으로 보지 않는다.
+var (
+	gitCommitsRequiredFields = map[string]jsonKind{"commits": jsonArray, "relation": jsonString, "truncated": jsonBoolean, "range_complete": jsonBoolean}
+	gitCommitRequiredFields  = map[string]jsonKind{"sha": jsonString, "files": jsonArray, "files_truncated": jsonBoolean}
+)
+
+// isAgentEnvelope — 성공은 200 + success:true + data 가 필수 칸을 갖춘 객체, 실패는 4xx·5xx + success:false + 코드.
+// 그 밖은 agent 의 봉투로 보지 않는다.
+func isAgentEnvelope(status int, body []byte, requiredFields map[string]jsonKind) bool {
 	var envelope struct {
-		Success *bool `json:"success"`
+		Success *bool          `json:"success"`
+		Data    map[string]any `json:"data"`
 		Error   struct {
 			Code string `json:"code"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil || envelope.Success == nil {
+		return false // data 가 객체가 아니어도(배열 등) 여기서 걸린다
+	}
+	if !*envelope.Success {
+		return status >= http.StatusBadRequest && envelope.Error.Code != ""
+	}
+	if status != http.StatusOK || envelope.Data == nil {
 		return false
 	}
-	if *envelope.Success {
-		return status == http.StatusOK
+	for field, kind := range requiredFields {
+		value, present := envelope.Data[field]
+		switch kind {
+		case jsonString:
+			_, present = value.(string)
+		case jsonBoolean:
+			_, present = value.(bool)
+		case jsonArray:
+			_, present = value.([]any)
+		}
+		if !present {
+			return false
+		}
 	}
-	return status >= http.StatusBadRequest && envelope.Error.Code != ""
+	return true
 }
 
 func isTimeout(err error) bool {

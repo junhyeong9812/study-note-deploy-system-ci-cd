@@ -42,10 +42,15 @@ master 에는 저장소가 없다. master 가 입력을 검사한 뒤 그 서비
 
 - **읽기만**: `rev-parse` · `merge-base` · `rev-list` · `log` · `show` 만 쓴다. `fetch` · `reset` · `checkout` · `gc` 를 부르지 않고 네트워크에 나가지 않는다. 배포 잠금을 잡지 않아 배포 중에도 답한다(대신 CPU·디스크는 나눠 쓴다).
 - **입력**: `service` 는 허용 목록(`DEPLOY_DIR_<SVC>` 가 있는 서비스)만, SHA 는 소문자 16진수 7~64자만, 칸은 하나씩. SHA 는 `rev-parse --verify` 로 커밋인지 확인해 전체 SHA 로 확정한 값만 쓰고, git 에는 인자 배열로 `--end-of-options` 뒤에 넘긴다.
-- **실행 환경**: 부모의 `GIT_*` 를 물려주지 않고 `LC_ALL=C` · `GIT_OPTIONAL_LOCKS=0` · `GIT_NO_LAZY_FETCH=1` · `GIT_NO_REPLACE_OBJECTS=1` · `GIT_TERMINAL_PROMPT=0` · `--no-pager` · `--no-ext-diff --no-textconv` · `-c core.quotePath=true` · `--src-prefix=a/ --dst-prefix=b/` 로 돈다. 판정은 종료 코드로만 한다.
-- **상한**(넘으면 자르고 알린다 — 조용히 자르지 않는다): 커밋 100개(`truncated`) · 파일 100개(`files_truncated`) · 파일 하나의 patch 500줄과 한 줄 2000바이트(`patch_truncated`) · 제목 500바이트 · 본문 8KB(`body_truncated`) · git 명령 하나의 출력 2MB(온전히 읽은 커밋·파일까지만) · 응답 JSON 2MB(커밋 목록은 오래된 커밋부터 빼고 `truncated`, 상세는 뒤 파일부터 patch 를 비우고 그래도 넘으면 뒤 파일부터 빼고 `files_truncated`) · 조회 하나 3초 · 동시 조회 2개(넘으면 기다리지 않고 429).
+- **실행 환경**: 부모의 `GIT_*` 를 물려주지 않고 `LC_ALL=C` · `GIT_OPTIONAL_LOCKS=0` · `GIT_NO_LAZY_FETCH=1` · `GIT_NO_REPLACE_OBJECTS=1` · `GIT_TERMINAL_PROMPT=0` · `--no-pager` · `--no-ext-diff --no-textconv` · `-c core.quotePath=true` · `--src-prefix=a/ --dst-prefix=b/` · `--submodule=short`(설정의 `diff.submodule=log` 가 머리줄 없는 줄을 앞 파일 patch 에 섞지 않게) 로 돈다. 판정은 종료 코드로만 한다.
+- **상한**(넘으면 자르고 알린다 — 조용히 자르지 않는다): 커밋 100개(`truncated`) · 파일 100개(`files_truncated`) · 파일 하나의 patch 500줄과 한 줄 2000바이트(`patch_truncated`) · 제목 500바이트 · 본문 8KB(`body_truncated`) · git 명령 하나의 출력 2MB(온전히 읽은 커밋·파일까지만) · 응답 JSON 2MB(커밋 목록은 오래된 커밋부터 빼고 `truncated`, 상세는 뒤 파일부터 patch 를 비우고 그래도 넘으면 뒤 파일부터 빼고 `files_truncated`) · 조회 하나 3초(아래 재시도 포함 전체) · 동시 조회 2개(넘으면 기다리지 않고 429).
 - **파일 목록과 patch 는 따로**: 파일 목록(경로·상태·줄 수)은 `--raw -z` · `--numstat -z` 에서 읽는다. 목록을 온전히 읽었으면 patch 출력이 상한에 걸려도 목록은 싣고, patch 를 온전히 읽지 못했거나 patch 조각과 파일의 짝(머리줄)을 확정하지 못한 파일만 `patch:""` + `patch_truncated:true`. `files_truncated` 는 목록 자체가 잘렸을 때(100개 초과 · 목록 출력 상한 · 응답 크기)만. 형 바뀜(파일↔심볼릭 링크)은 `modified` 한 파일로, patch 는 두 조각을 이어 붙인다.
+- **조회 도중 이력이 바뀌면**: 얕은 경계 목록(`.git/shallow` 의 내용)을 git 명령들 앞과 뒤에 읽어 비교한다. 같으면 그 결과, 다르면(그 사이 배포의 `fetch` 가 이력을 바꿨다) 결과를 버리고 처음부터 한 번 더, 그래도 다르면 503 `repository_changing`. 경계 판정(`parent_unavailable` · `relation` · `range_complete`)은 그 한 번의 일관된 목록으로 한다. 바뀌지 않으면 명령마다 한 번만 돈다.
+- **기한**: agent 의 조회 기한 3초 + 자식 정리 대기 0.5초(파이프를 쥔 손자 프로세스가 남아도 이 뒤에는 끝난다) < master 의 중계 기한 4초 — `git_timeout` 과 `agent_timeout` 이 섞이지 않는다.
+- **master 의 성공 봉투 검사**: 200 이어도 `data` 가 필수 칸을 갖추지 않으면 502 `unexpected_response` — 목록은 `commits`(배열) · `relation`(글자) · `truncated` · `range_complete`(참거짓), 상세는 `sha`(글자) · `files`(배열) · `files_truncated`(참거짓).
 - 작성자 이메일은 내지 않는다. 오류에 git 의 오류 글자·디렉터리 경로를 넣지 않는다.
+- 응답 2MB 는 실제로 보내는 봉투의 직렬화 길이로 확인한다.
+- 알려진 한계: UTF-8 이 아닌 바이트(옛 인코딩의 파일 내용·경로)는 JSON 으로 내면서 U+FFFD 로 바뀐다. 커밋 하나의 메시지가 2MB 를 넘으면 상세는 500 `git_failed` 다.
 
 | 상황 | agent | master |
 |---|---|---|
@@ -56,8 +61,9 @@ master 에는 저장소가 없다. master 가 입력을 검사한 뒤 그 서비
 | 두 커밋의 관계를 얕은 이력으로 알 수 없음 | 200 `relation:"unknown"` · 빈 목록 | 그대로 |
 | 얕은 이력의 경계 커밋의 diff(부모가 로컬에 없다) | 404 `parent_unavailable` | 그대로 |
 | 동시 조회 초과 | 429 `too_many_requests` | 그대로 |
+| 조회 도중 이력이 두 번 다 바뀜(배포의 fetch 중) | 503 `repository_changing` | 그대로 |
 | git 기한 초과 · git 실패 | 504 `git_timeout` · 500 `git_failed` | 그대로 |
-| agent 에 닿지 못함 · 4초 안에 답 없음 · 봉투가 아님(4MB 초과 포함) | — | 502 `agent_unreachable` · 504 `agent_timeout` · 502 `unexpected_response` |
+| agent 에 닿지 못함 · 4초 안에 답 없음 · 봉투가 아님(4MB 초과 · 성공인데 필수 칸 없음 포함) | — | 502 `agent_unreachable` · 504 `agent_timeout` · 502 `unexpected_response` |
 
 ## 대상 repo가 지켜야 할 것
 

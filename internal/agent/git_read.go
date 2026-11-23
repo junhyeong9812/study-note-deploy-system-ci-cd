@@ -12,11 +12,11 @@ package agent
 // 조회는 busy 잠금을 잡지 않는다. 동시 조회는 두 경로를 합쳐 gitReadConcurrency 개까지, 넘으면 기다리지 않고 429.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -99,6 +99,11 @@ const (
 	gitLineCutMarker     = " …(잘림)"                                // patch 한 줄을 자른 자리
 	gitEnvelopeAllowance = 64                                      // 봉투({"data":…,"success":true}\n)가 data 에 더하는 바이트의 넉넉한 몫
 	gitRelationUnknown   = "unknown"                               // 이력이 얕은 경계에서 끊겨 알 수 없음 — 목록은 빈 배열, range_complete:false
+	gitReadAttempts      = 2                                       // 조회 도중 얕은 경계가 바뀌면 처음부터 한 번 더 — 그래도 바뀌면 503
+	// gitProcessWaitDelay — 기한에 자식을 죽인 뒤, 파이프를 쥔 손자 프로세스가 남아도 Wait 가 끝나기까지 주는 시간.
+	// gitReadTimeout(3초) + 이 값은 master 의 중계 기한(4초)보다 작아야 한다(git_timeout 과 agent_timeout 이 섞이지 않게 — 명세 12.9).
+	gitProcessWaitDelay       = 500 * time.Millisecond
+	gitCodeRepositoryChanging = "repository_changing" // 503 — 배포의 fetch 가 조회 도중 이력을 바꾸는 중
 )
 
 // 조회 실패의 갈래 — 응답 코드는 이것으로만 정한다. git 의 오류 글자는 읽지 않는다(지역 설정을 탄다 — 명세 12.5).
@@ -108,7 +113,12 @@ var (
 	errParentUnavailable   = errors.New(gitCodeParentUnavailable)
 	errUnexpectedGitOutput = errors.New("git 출력 형식이 예상과 다름")
 	errShallowListUnread   = errors.New("shallow 목록 읽기 실패")
+	errRepositoryChanging  = errors.New(gitCodeRepositoryChanging)
+	errGitOutputLimit      = errors.New("git 출력 상한")
 )
+
+// gitRead — 조회 하나의 본체. boundaries 는 그 조회 전체가 쓰는 하나의 얕은 경계 목록이다.
+type gitRead func(reader *gitReader, shas []string, boundaries map[string]bool) (any, error)
 
 // git 이 확정해 준 전체 SHA(SHA-1 40자 · SHA-256 64자).
 var fullCommitSha = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
@@ -136,7 +146,7 @@ func (agent *Agent) handleGitCommit(writer http.ResponseWriter, request *http.Re
 // serveGitRead — 두 조회의 공통 접수: 인증 → 입력 전체 검사 → 동시 조회 자리(기다리지 않는다) → git.
 // 틀린 입력으로는 git 을 띄우지 않는다. busy 잠금은 잡지 않는다(배포를 막지 않는다).
 func (agent *Agent) serveGitRead(writer http.ResponseWriter, request *http.Request, name string, shaFields []string,
-	read func(reader *gitReader, shas []string) (any, error)) {
+	read gitRead) {
 	if !shared.SecretMatches(request, agent.secret) {
 		shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")
 		return
@@ -169,7 +179,7 @@ func (agent *Agent) serveGitRead(writer http.ResponseWriter, request *http.Reque
 	ctx, cancel := context.WithTimeout(request.Context(), agent.gitTimeout)
 	defer cancel()
 	startedAt := time.Now()
-	data, err := read(&gitReader{ctx: ctx, program: agent.gitProgram, directory: directory}, shas)
+	data, err := (&gitReader{ctx: ctx, program: agent.gitProgram, directory: directory}).readConsistently(read, shas)
 	tookMs := time.Since(startedAt).Milliseconds()
 	switch {
 	case err == nil:
@@ -179,6 +189,9 @@ func (agent *Agent) serveGitRead(writer http.ResponseWriter, request *http.Reque
 		shared.WriteFail(writer, http.StatusNotFound, gitCodeCommitNotFound, "")
 	case errors.Is(err, errParentUnavailable):
 		shared.WriteFail(writer, http.StatusNotFound, gitCodeParentUnavailable, "")
+	case errors.Is(err, errRepositoryChanging):
+		agent.logger.Log(requestID, fmt.Sprintf("agent git %s repository changing %s %dms", name, service, tookMs), "warning")
+		shared.WriteFail(writer, http.StatusServiceUnavailable, gitCodeRepositoryChanging, "")
 	case errors.Is(err, errGitTimeout):
 		agent.logger.Log(requestID, fmt.Sprintf("agent git %s timeout %s %dms", name, service, tookMs), "warning")
 		shared.WriteFail(writer, http.StatusGatewayTimeout, gitCodeTimeout, "")
@@ -198,11 +211,7 @@ func singleQueryValue(query map[string][]string, key string) (string, bool) {
 }
 
 // readCommitRange — A 다음부터 B 까지(A 제외·B 포함), git 의 순회 순서(--topo-order, B 쪽이 먼저).
-func readCommitRange(reader *gitReader, shas []string) (any, error) {
-	boundaries, err := reader.shallowBoundaries()
-	if err != nil {
-		return nil, err
-	}
+func readCommitRange(reader *gitReader, shas []string, boundaries map[string]bool) (any, error) {
 	from, err := reader.resolveCommit(shas[0])
 	if err != nil {
 		return nil, err
@@ -309,14 +318,23 @@ func limitRangeSize(result *GitCommitRange) {
 		result.Commits = result.Commits[:last]
 		result.Truncated = true
 	}
+	for len(result.Commits) > 0 && encodedEnvelopeLength(*result) > gitResponseByteLimit { // 근사가 모자랐으면 실제 길이로 마저
+		result.Commits = result.Commits[:len(result.Commits)-1]
+		result.Truncated = true
+	}
+}
+
+// encodedEnvelopeLength — shared.WriteOK 가 실제로 쓰는 바이트 수(봉투·HTML 이스케이프·끝 줄바꿈 포함).
+func encodedEnvelopeLength(data any) int {
+	var buffer bytes.Buffer
+	if err := json.NewEncoder(&buffer).Encode(map[string]any{"success": true, "data": data}); err != nil {
+		return 0
+	}
+	return buffer.Len()
 }
 
 // readCommitDetail — 커밋 하나와 그 첫째 부모와의 차이. 얕은 경계 커밋은 부모가 없어 틀린 diff 가 되므로 답하지 않는다.
-func readCommitDetail(reader *gitReader, shas []string) (any, error) {
-	boundaries, err := reader.shallowBoundaries()
-	if err != nil {
-		return nil, err
-	}
+func readCommitDetail(reader *gitReader, shas []string, boundaries map[string]bool) (any, error) {
 	sha, err := reader.resolveCommit(shas[0])
 	if err != nil {
 		return nil, err
@@ -365,37 +383,47 @@ func gitEnvironment() []string {
 		"GIT_NO_REPLACE_OBJECTS=1", "GIT_TERMINAL_PROMPT=0")
 }
 
-// run — git 을 인자 배열로(셸 없음) 돌리고 stdout 을 읽으면서 gitOutputByteLimit 을 건다. stderr 는 버린다(응답·로그에 넣지 않는다).
-// 상한을 넘으면 더 읽지 않고 프로세스를 끝낸 뒤 overflowed=true — 오류가 아니다, 호출한 쪽이 온전한 레코드까지만 쓴다.
-// 기한이 지나면 CommandContext 가 자식을 죽이고 Wait 가 끝날 때까지 기다린다(좀비를 남기지 않는다).
+// limitedOutput — stdout 을 받으면서 gitOutputByteLimit 을 건다. 넘으면 더 받지 않고 오류를 돌려 파이프를 닫게 한다
+// (git 은 다음 쓰기에서 SIGPIPE 로 끝난다). 다 읽은 뒤에 재지 않는다.
+type limitedOutput struct {
+	buffer     bytes.Buffer
+	overflowed bool
+}
+
+func (output *limitedOutput) Write(chunk []byte) (int, error) {
+	room := gitOutputByteLimit - output.buffer.Len()
+	if len(chunk) > room {
+		output.buffer.Write(chunk[:room])
+		output.overflowed = true
+		return room, errGitOutputLimit
+	}
+	return output.buffer.Write(chunk)
+}
+
+// run — git 을 인자 배열로(셸 없음) 돌린다. stderr 는 버린다(응답·로그에 넣지 않는다).
+// 출력이 상한을 넘으면 overflowed=true — 오류가 아니다, 호출한 쪽이 온전한 레코드까지만 쓴다.
+// 기한이 지나면 CommandContext 가 자식을 죽이고, 파이프를 쥔 손자가 남아도 gitProcessWaitDelay 뒤에는 Wait 가 끝난다.
 func (reader *gitReader) run(subcommand string, arguments ...string) (output []byte, overflowed bool, err error) {
 	command := exec.CommandContext(reader.ctx, reader.program, append([]string{"--no-pager", "-c", "core.quotePath=true", subcommand}, arguments...)...)
 	command.Dir = reader.directory
 	command.Env = gitEnvironment()
-	command.WaitDelay = time.Second // 자식이 물려준 파이프를 누가 쥐고 있어도 Wait 가 끝나게
-	stdout, err := command.StdoutPipe()
-	if err != nil {
-		return nil, false, &gitCommandError{subcommand, -1}
-	}
+	command.WaitDelay = gitProcessWaitDelay
+	standardOutput := &limitedOutput{}
+	command.Stdout = standardOutput
 	if err := command.Start(); err != nil {
 		if reader.ctx.Err() != nil {
 			return nil, false, errGitTimeout
 		}
 		return nil, false, &gitCommandError{subcommand, -1}
 	}
-	output, readErr := io.ReadAll(io.LimitReader(stdout, gitOutputByteLimit+1))
-	if len(output) > gitOutputByteLimit {
-		output, overflowed = output[:gitOutputByteLimit], true
-		_ = command.Process.Kill() // 남은 출력은 버린다 — 이미 상한
-	}
 	waitErr := command.Wait()
-	if overflowed {
-		return output, true, nil
+	if standardOutput.overflowed {
+		return standardOutput.buffer.Bytes(), true, nil
 	}
 	if waitErr != nil && reader.ctx.Err() != nil {
 		return nil, false, errGitTimeout
 	}
-	if waitErr != nil || readErr != nil {
+	if waitErr != nil {
 		exitCode := -1
 		var exitError *exec.ExitError
 		if errors.As(waitErr, &exitError) {
@@ -403,32 +431,71 @@ func (reader *gitReader) run(subcommand string, arguments ...string) (output []b
 		}
 		return nil, false, &gitCommandError{subcommand, exitCode}
 	}
-	return output, false, nil
+	return standardOutput.buffer.Bytes(), false, nil
 }
 
-// shallowBoundaries — 얕은 저장소의 경계 커밋(부모가 로컬에 없는 커밋). 얕지 않으면 빈 집합.
-// 조회마다 가장 먼저 부른다 — 디렉터리가 저장소가 아니면 여기서 git_failed 로 끝나, 뒤의 "커밋 없음(404)"과 섞이지 않는다.
-func (reader *gitReader) shallowBoundaries() (map[string]bool, error) {
+// readConsistently — 조회 하나는 변하지 않은 이력 위에서만 답한다(명세 12.9). 얕은 경계 목록을 git 명령들 앞뒤로 읽어
+// 같으면 그 결과(오류 포함)를 내고, 다르면(그 사이 배포의 fetch 가 이력을 바꿨다) 결과를 버리고 처음부터 다시 한다.
+// gitReadAttempts 번 모두 다르면 repository_changing. 기한은 재시도를 포함해 조회 하나 전체에 걸린다(같은 ctx).
+// 경계 판정(parent_unavailable·relation·range_complete)은 그 한 번의 목록으로만 한다 — 명령마다 따로 방어하지 않는다.
+func (reader *gitReader) readConsistently(read gitRead, shas []string) (any, error) {
+	for attempt := 0; attempt < gitReadAttempts; attempt++ {
+		path, err := reader.shallowPath()
+		if err != nil {
+			return nil, err
+		}
+		before, err := readShallowList(path)
+		if err != nil {
+			return nil, err
+		}
+		data, readErr := read(reader, shas, shallowSet(before))
+		if errors.Is(readErr, errGitTimeout) {
+			return nil, readErr
+		}
+		after, err := readShallowList(path)
+		if err != nil {
+			return nil, err
+		}
+		if after == before {
+			return data, readErr
+		}
+	}
+	return nil, errRepositoryChanging
+}
+
+// shallowPath — 얕은 경계 목록 파일의 위치. 조회마다 가장 먼저 부른다 — 디렉터리가 저장소가 아니면 여기서 git_failed 로 끝나,
+// 뒤의 "커밋 없음(404)"과 섞이지 않는다.
+func (reader *gitReader) shallowPath() (string, error) {
 	output, _, err := reader.run("rev-parse", "--git-path", "shallow")
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	path := strings.TrimSuffix(string(output), "\n")
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(reader.directory, path)
 	}
+	return path, nil
+}
+
+// readShallowList — 얕은 경계 목록의 내용 그대로(비교용). 파일이 없으면 얕지 않은 저장소 — 빈 글자.
+func readShallowList(path string) (string, error) {
 	content, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return map[string]bool{}, nil
+		return "", nil
 	}
 	if err != nil {
-		return nil, errShallowListUnread
+		return "", errShallowListUnread
 	}
+	return string(content), nil
+}
+
+// shallowSet — 얕은 경계 커밋(부모가 로컬에 없는 커밋)의 집합.
+func shallowSet(content string) map[string]bool {
 	boundaries := map[string]bool{}
-	for _, sha := range strings.Fields(string(content)) {
+	for _, sha := range strings.Fields(content) {
 		boundaries[sha] = true
 	}
-	return boundaries, nil
+	return boundaries
 }
 
 // resolveCommit — 형식 검사를 지난 SHA 가 이 저장소의 커밋인지 확인하고 전체 SHA 로 확정한다. 뒤의 명령은 이 값만 쓴다.
@@ -490,7 +557,7 @@ func parseCommits(output []byte, overflowed bool) ([]GitCommit, error) {
 // 병합 커밋은 첫째 부모와의 차이, 이름 바꾸기 탐지는 -M 고정, 외부 diff·textconv·색 없음.
 func diffArguments(sha string, outputOptions ...string) []string {
 	arguments := []string{"--format=", "--no-color", "--no-ext-diff", "--no-textconv", "--no-show-signature",
-		"-M", "--diff-merges=first-parent", "--src-prefix=a/", "--dst-prefix=b/"}
+		"-M", "--diff-merges=first-parent", "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short"}
 	arguments = append(arguments, outputOptions...)
 	return append(arguments, "--end-of-options", sha)
 }
@@ -792,6 +859,19 @@ func limitResponseSize(detail *GitCommitDetail) {
 		size -= len(encodedFile) + len(",")
 		detail.Files = detail.Files[:last]
 		detail.FilesTruncated = true
+	}
+	for len(detail.Files) > 0 && encodedEnvelopeLength(*detail) > gitResponseByteLimit { // 근사가 모자랐으면 실제 길이로 마저
+		emptied := false
+		for index := len(detail.Files) - 1; index >= 0 && !emptied; index-- {
+			if file := &detail.Files[index]; file.Patch != nil && *file.Patch != "" {
+				empty := ""
+				file.Patch, file.PatchTruncated, emptied = &empty, true, true
+			}
+		}
+		if !emptied {
+			detail.Files = detail.Files[:len(detail.Files)-1]
+			detail.FilesTruncated = true
+		}
 	}
 }
 
