@@ -116,16 +116,15 @@ type ResourceCollector struct {
 	stats ResourceCollectorStats
 
 	// 아래는 한 번에 하나만 도는 수집(InFlight)만 읽고 쓴다 — 겹침 방지가 차례를 보장한다.
-	previousCollection *time.Duration                      // 앞 수집의 단조 시각(interval_ms)
-	previousCPU        *cpuSample                          // 서버 전체 CPU 의 앞 표본
-	previousCounters   map[string]map[string]counterSample // 갈래(net_rx · net_tx · io_read · io_write) → 장치 → 앞 표본
-	previousContainers map[string]containerSample          // 컨테이너 전체 ID → 앞 표본
-	failureStreak      int64                               // 지금 이어지는 전송 실패 횟수(mutex 아래)
-	skipping           bool                                // 지금 이어지는 건너뜀(mutex 아래) — 첫 번에만 로그
-	gpuExecID          string                              // 끝났다고 확인하지 못한 GPU 조회용 실행(§12) — 있으면 새로 만들지 않는다
-	gpuSkipStreak      int64                               // 지금 이어지는 GPU 건너뜀
-	gpuSkipStartedAt   time.Duration                       // 그 건너뜀이 시작된 단조 시각
-	gpuSkipLoggedAt    time.Duration                       // 그 건너뜀의 마지막 로그 단조 시각
+	previousCollection  *time.Duration                      // 앞 수집의 단조 시각(interval_ms)
+	previousCPU         *cpuSample                          // 서버 전체 CPU 의 앞 표본
+	previousCounters    map[string]map[string]counterSample // 갈래(net_rx · net_tx · io_read · io_write) → 장치 → 앞 표본
+	previousContainers  map[string]containerSample          // 컨테이너 전체 ID → 앞 표본
+	failureStreak       int64                               // 지금 이어지는 전송 실패 횟수(mutex 아래)
+	skipping            bool                                // 지금 이어지는 건너뜀(mutex 아래) — 첫 번에만 로그
+	gpuMissingStreak    int64                               // 지금 이어지는 GPU 결측(§13 — 로그용)
+	gpuMissingStartedAt time.Duration                       // 그 결측이 시작된 단조 시각
+	gpuMissingLoggedAt  time.Duration                       // 그 결측의 마지막 로그 단조 시각
 }
 
 type cpuSample struct {
@@ -148,7 +147,7 @@ type containerSample struct {
 func (agent *Agent) StartResourceMetrics(ctx context.Context) *ResourceCollector {
 	settings := LoadResourceMetricsSettings()
 	if settings.RedisAddress == "" {
-		agent.logger.Log("metrics", "resource metrics disabled: LOG_REDIS_URL is empty", "info")
+		agent.logger.Log("metrics", "resource metrics disabled: LOG_REDIS_URL is empty or invalid", "info")
 		return nil
 	}
 	collector := agent.newResourceCollector(settings)
@@ -257,11 +256,13 @@ func (collector *ResourceCollector) collectAndSend(parent context.Context) {
 		body.Containers = containers
 	}
 	if collector.settings.GPUContainer != "" {
-		if gpus, err := collector.readGPUs(ctx); err != nil {
+		gpus, reason := collector.readGPUs(ctx)
+		if reason != "" {
 			body.Missing = append(body.Missing, missingGPUs)
 		} else {
 			body.GPUs = gpus
 		}
+		collector.noteGPUResult(reason)
 	}
 	encoded, err := encodeResourceBody(body, truncated)
 	if err == nil {
@@ -674,97 +675,149 @@ func containerMemoryUsed(stats dockerContainerStats) *uint64 {
 
 const mebibyte = 1048576
 
-// readGPUs — 고정 명령 하나(§12 — 조회용 실행은 한 번에 하나만 살아 있다). 전부 GPU 기한 안이다.
-//   - 남은 실행(gpuExecID)이 있으면 먼저 그 상태를 묻는다: 끝남 · 사라짐(404) → 잊고 새로 조회, 도는 중 · 알 수 없음 → 건너뛴다.
-//   - 실행은 만든 즉시 기억한다(시작 전에). 끝났다고 확인한 뒤에만 잊는다 — 시작 오류 · 기한 초과 · 끝내 도는 중이면 남은 실행이다.
-//   - 종료 코드가 0 이 아니거나 · 어느 줄이든 꼴이 틀리거나 · 줄이 없으면 오류(갈래 전체 결측).
-func (collector *ResourceCollector) readGPUs(parent context.Context) ([]GPUResource, error) {
+// GPU 결측의 이유 갈래 — "GPU 결측이 이어짐" 로그에 싣는다(도커 · 명령의 글자는 싣지 않는다).
+const (
+	gpuReasonQueryRunning = "previous query still running"
+	gpuReasonCannotJudge  = "cannot judge running execs"
+	gpuReasonContainer    = "gpu container lookup failed"
+	gpuReasonCreate       = "exec create failed"
+	gpuReasonStart        = "exec start failed"
+	gpuReasonDeadline     = "deadline exceeded"
+	gpuReasonNotFinished  = "exec not finished"
+	gpuReasonExitCode     = "non-zero exit code"
+	gpuReasonOutput       = "unreadable output"
+	gpuExecListLimit      = 20                    // 컨테이너의 실행이 이보다 많으면 판단하지 않는다
+	gpuExecPollInterval   = 50 * time.Millisecond // 끝난 직후 종료 상태를 다시 묻는 간격
+	gpuMissingLogInterval = time.Hour             // GPU 결측이 이어지는 동안 로그 간격
+)
+
+// readGPUs — 고정 명령 하나(§13 · §13.1 — 조회용 실행은 한 번에 하나. 기억하지 않고 매번 도커에게 묻는다). 전부 GPU 기한 안이다.
+//  1. GPU 컨테이너의 실행 목록(ExecIDs)과 각 실행의 상태 · 명령을 묻는다. 우리 실행 = 명령이 gpuQueryCommand 와 정확히 같은 것.
+//     도는 우리 실행이 있으면 건너뛴다(GPUSkipped). 판단할 수 없으면(조회 실패 · 명령 칸 없음/꼴 다름 · 목록 20개 초과) 만들지 않는다.
+//     그 사이 사라진 실행(404)은 없음이다. 다른 명령 · 끝난 실행은 막지 않는다.
+//  2. 시작 안 된 우리 실행이 있으면 그 하나를 시작하고, 없으면 새로 만든다.
+//  3. 출력이 끝나면 종료 상태를 기한 안에서 다시 묻는다. 종료 코드 ≠ 0 · 꼴 오류 · 줄 없음은 결측.
+//
+// 돌려주는 reason 이 "" 가 아니면 결측이고 그 이유의 갈래다.
+func (collector *ResourceCollector) readGPUs(parent context.Context) ([]GPUResource, string) {
 	ctx, cancel := context.WithTimeout(parent, collector.gpuDeadline)
 	defer cancel()
-	if collector.gpuExecID != "" {
-		running, _, err := collector.docker.inspectExec(ctx, collector.gpuExecID)
-		if (err != nil && !errors.Is(err, errDockerNotFound)) || (err == nil && running) { // 도는 중 · 알 수 없음
-			collector.noteGPUSkipped()
-			return nil, errors.New("gpu query skipped: previous exec may still be running")
+	failed := func(reason string) string {
+		if ctx.Err() != nil {
+			return gpuReasonDeadline
 		}
-		collector.gpuExecID = "" // 끝났거나 사라졌다
-		collector.noteGPUResumed()
+		return reason
 	}
-
-	id, err := collector.docker.createExec(ctx, collector.settings.GPUContainer, gpuQueryCommand)
+	ids, err := collector.docker.containerExecIDs(ctx, collector.settings.GPUContainer)
 	if err != nil {
-		return nil, err
+		return nil, failed(gpuReasonContainer)
 	}
-	collector.gpuExecID = id
-	output, err := collector.docker.startExec(ctx, id)
-	if err != nil {
-		return nil, err
+	if len(ids) > gpuExecListLimit {
+		return nil, gpuReasonCannotJudge
 	}
-	exitCode, err := collector.waitGPUExecExit(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if exitCode != 0 {
-		return nil, fmt.Errorf("gpu query exit code %d", exitCode)
-	}
-	return parseGPUQuery(output)
-}
-
-// waitGPUExecExit — 출력이 끝난 뒤 실행의 종료 상태. 도커의 종료 처리가 출력 닫힘보다 늦을 수 있어 ctx 기한 안에서 짧게 다시 묻는다.
-// 끝났으면(또는 사라졌으면) 기억을 지운다. 기한까지 도는 중이거나 상태를 알 수 없으면 기억을 남기고 오류.
-func (collector *ResourceCollector) waitGPUExecExit(ctx context.Context, id string) (int, error) {
-	for {
-		running, exitCode, err := collector.docker.inspectExec(ctx, id)
+	unstarted := ""
+	for _, id := range ids {
+		state, err := collector.docker.inspectExec(ctx, id)
 		if errors.Is(err, errDockerNotFound) {
-			collector.gpuExecID = ""
-			return 0, err
+			continue // 목록과 조회 사이에 사라졌다
 		}
 		if err != nil {
-			return 0, err
+			return nil, failed(gpuReasonCannotJudge)
 		}
-		if !running {
-			collector.gpuExecID = ""
-			return exitCode, nil
+		if !isGPUQueryCommand(state) {
+			continue
+		}
+		if state.Running {
+			collector.mutex.Lock()
+			collector.stats.GPUSkipped++
+			collector.mutex.Unlock()
+			return nil, gpuReasonQueryRunning
+		}
+		if state.ExitCode == nil && unstarted == "" {
+			unstarted = id // 시작 안 된 우리 실행 — 새로 만들지 않고 다시 쓴다
+		}
+	}
+
+	id := unstarted
+	if id == "" {
+		if id, err = collector.docker.createExec(ctx, collector.settings.GPUContainer, gpuQueryCommand); err != nil {
+			return nil, failed(gpuReasonCreate)
+		}
+	}
+	output, err := collector.docker.startExec(ctx, id)
+	if err != nil {
+		return nil, failed(gpuReasonStart)
+	}
+	exitCode, reason := collector.waitGPUExecExit(ctx, id)
+	if reason != "" {
+		return nil, failed(reason)
+	}
+	if exitCode != 0 {
+		return nil, gpuReasonExitCode
+	}
+	gpus, err := parseGPUQuery(output)
+	if err != nil {
+		return nil, gpuReasonOutput
+	}
+	return gpus, ""
+}
+
+// isGPUQueryCommand — 실행의 명령이 고정 조회 명령과 정확히 같은가.
+func isGPUQueryCommand(state dockerExecState) bool {
+	if state.Entrypoint != gpuQueryCommand[0] || len(state.Arguments) != len(gpuQueryCommand)-1 {
+		return false
+	}
+	for index, argument := range state.Arguments {
+		if argument != gpuQueryCommand[index+1] {
+			return false
+		}
+	}
+	return true
+}
+
+// waitGPUExecExit — 출력이 끝난 뒤 실행의 종료 코드. 도커의 종료 처리가 출력 닫힘보다 늦을 수 있어 ctx 기한 안에서 짧게 다시 묻는다.
+// 기한까지 끝났다고 확인하지 못하면 reason 을 돌려준다(그 실행은 도커의 목록에 남아 다음 수집이 본다).
+func (collector *ResourceCollector) waitGPUExecExit(ctx context.Context, id string) (int, string) {
+	for {
+		state, err := collector.docker.inspectExec(ctx, id)
+		if err != nil {
+			return 0, gpuReasonNotFinished
+		}
+		if !state.Running && state.ExitCode != nil {
+			return *state.ExitCode, ""
 		}
 		select {
 		case <-ctx.Done():
-			return 0, fmt.Errorf("gpu exec still running: %w", ctx.Err())
+			return 0, gpuReasonNotFinished
 		case <-time.After(gpuExecPollInterval):
 		}
 	}
 }
 
-const gpuExecPollInterval = 50 * time.Millisecond // 끝난 직후 종료 상태를 다시 묻는 간격
-const gpuStuckLogInterval = time.Hour             // GPU 건너뜀이 이어지는 동안 로그 간격
-
-// noteGPUSkipped — 건너뜀을 센다. 로그는 건너뜀이 시작될 때 1줄, 이어지는 동안 앞 줄로부터 1시간마다 1줄(수집기의 단조 시계).
-func (collector *ResourceCollector) noteGPUSkipped() {
-	collector.mutex.Lock()
-	collector.stats.GPUSkipped++
-	collector.mutex.Unlock()
+// noteGPUResult — "GPU 결측이 이어짐" 로그. 결측이 된 첫 수집에 1줄, 이어지는 동안 앞 줄로부터 1시간마다 1줄(이어진 횟수 · 시간 ·
+// 마지막 이유의 갈래), 값이 다시 읽히면 1줄. 이유가 바뀌어도 새 첫 줄은 없다. 시간은 수집기의 단조 시계.
+func (collector *ResourceCollector) noteGPUResult(reason string) {
 	now := collector.monotonicNow()
-	collector.gpuSkipStreak++
-	if collector.gpuSkipStreak == 1 {
-		collector.gpuSkipStartedAt, collector.gpuSkipLoggedAt = now, now
-		collector.logf(fmt.Sprintf("resource metrics gpu query skipped: previous nvidia-smi exec in %s is still running or unknown (further skips are counted)",
-			collector.settings.GPUContainer), "warning")
+	if reason == "" {
+		if collector.gpuMissingStreak > 0 {
+			collector.logf(fmt.Sprintf("resource metrics gpu values readable again after %d missing collections over %s",
+				collector.gpuMissingStreak, (now-collector.gpuMissingStartedAt).Round(time.Second)), "info")
+		}
+		collector.gpuMissingStreak = 0
 		return
 	}
-	if now-collector.gpuSkipLoggedAt >= gpuStuckLogInterval {
-		collector.gpuSkipLoggedAt = now
-		collector.logf(fmt.Sprintf("resource metrics gpu query still skipped: %d collections over %s (previous nvidia-smi exec in %s)",
-			collector.gpuSkipStreak, (now-collector.gpuSkipStartedAt).Round(time.Second), collector.settings.GPUContainer), "warning")
-	}
-}
-
-// noteGPUResumed — 남은 실행이 끝난(사라진) 것을 확인했다. 건너뜀이 이어지던 중이면 1줄.
-func (collector *ResourceCollector) noteGPUResumed() {
-	if collector.gpuSkipStreak == 0 {
+	collector.gpuMissingStreak++
+	if collector.gpuMissingStreak == 1 {
+		collector.gpuMissingStartedAt, collector.gpuMissingLoggedAt = now, now
+		collector.logf(fmt.Sprintf("resource metrics gpu values missing (gpu container %s): %s — further missing collections are counted",
+			collector.settings.GPUContainer, reason), "warning")
 		return
 	}
-	collector.logf(fmt.Sprintf("resource metrics gpu query resumed after %d skipped collections over %s",
-		collector.gpuSkipStreak, (collector.monotonicNow()-collector.gpuSkipStartedAt).Round(time.Second)), "info")
-	collector.gpuSkipStreak = 0
+	if now-collector.gpuMissingLoggedAt >= gpuMissingLogInterval {
+		collector.gpuMissingLoggedAt = now
+		collector.logf(fmt.Sprintf("resource metrics gpu values still missing: %d collections over %s (last reason: %s)",
+			collector.gpuMissingStreak, (now-collector.gpuMissingStartedAt).Round(time.Second), reason), "warning")
+	}
 }
 
 // parseGPUQuery — 줄마다 "번호, 사용률, 메모리 사용(MiB), 메모리 전체(MiB), 온도". 출력 글자는 오류에 싣지 않는다.

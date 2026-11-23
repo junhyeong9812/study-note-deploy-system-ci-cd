@@ -164,22 +164,49 @@ func (docker *dockerAPI) startExec(ctx context.Context, id string) (string, erro
 	return readMultiplexedStdout(response.Body, dockerExecOutputLimit)
 }
 
-// inspectExec — 실행의 상태. 끝났으면 running=false 와 종료 코드. 실행이 없으면 errDockerNotFound.
-func (docker *dockerAPI) inspectExec(ctx context.Context, id string) (running bool, exitCode int, err error) {
+// dockerExecState — GET /exec/{id}/json 에서 쓰는 칸. 시작 안 함 = Running:false · ExitCode:null, 끝남 = ExitCode 가 있다.
+// 명령(entrypoint · arguments)은 우리 조회 명령과 같은지 비교하는 데만 쓴다 — 싣지도 남기지도 않는다.
+type dockerExecState struct {
+	Running    bool
+	ExitCode   *int
+	Entrypoint string
+	Arguments  []string
+}
+
+// errDockerExecCommandUnknown — 실행 조회는 됐는데 명령 칸이 없거나 꼴이 다르다(판단할 수 없음).
+var errDockerExecCommandUnknown = errors.New("docker exec: command unknown")
+
+// inspectExec — 실행의 상태와 명령. 실행이 없으면 errDockerNotFound, 명령 칸이 없거나 꼴이 다르면 errDockerExecCommandUnknown.
+func (docker *dockerAPI) inspectExec(ctx context.Context, id string) (dockerExecState, error) {
 	var inspect struct {
-		Running  bool `json:"Running"`
-		ExitCode *int `json:"ExitCode"`
+		Running       bool            `json:"Running"`
+		ExitCode      *int            `json:"ExitCode"`
+		ProcessConfig json.RawMessage `json:"ProcessConfig"`
 	}
 	if err := docker.decode(ctx, http.MethodGet, "/exec/"+url.PathEscape(id)+"/json", nil, &inspect); err != nil {
-		return false, 0, err
+		return dockerExecState{}, err
 	}
-	if inspect.Running {
-		return true, 0, nil
+	var process struct {
+		Entrypoint *string   `json:"entrypoint"`
+		Arguments  *[]string `json:"arguments"`
 	}
-	if inspect.ExitCode == nil {
-		return false, 0, errors.New("docker exec: finished without exit code")
+	if len(inspect.ProcessConfig) == 0 || json.Unmarshal(inspect.ProcessConfig, &process) != nil || process.Entrypoint == nil {
+		return dockerExecState{}, errDockerExecCommandUnknown
 	}
-	return false, *inspect.ExitCode, nil
+	state := dockerExecState{Running: inspect.Running, ExitCode: inspect.ExitCode, Entrypoint: *process.Entrypoint}
+	if process.Arguments != nil {
+		state.Arguments = *process.Arguments
+	}
+	return state, nil
+}
+
+// containerExecIDs — 컨테이너의 실행 목록(ExecIDs — 시작 안 한 실행과 도는 실행. null 이면 빈 목록).
+func (docker *dockerAPI) containerExecIDs(ctx context.Context, containerName string) ([]string, error) {
+	var inspect struct {
+		ExecIDs []string `json:"ExecIDs"`
+	}
+	err := docker.decode(ctx, http.MethodGet, "/containers/"+url.PathEscape(containerName)+"/json", nil, &inspect)
+	return inspect.ExecIDs, err
 }
 
 // readMultiplexedStdout — 다중화된 흐름(조각마다 8바이트 머리 [흐름, 0, 0, 0, 길이(빅엔디언 4바이트)] + 내용)에서 stdout(1)만 잇는다.
