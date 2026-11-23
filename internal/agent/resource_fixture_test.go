@@ -335,15 +335,21 @@ type fakeDocker struct {
 	execCreateStatus int
 	gpuOutput        string
 	gpuExitCode      int
-	requests         []dockerRequest
-	releases         chan stallRelease
-	server           *httptest.Server
+	execStartStatus  int // 0 이 아니면 exec 시작이 이 상태로 실패(만들기는 성공 — ID 는 이미 있다)
+	execRunningCount int // 실행마다 처음 이만큼의 상태 조회는 Running:true(도커의 종료 처리가 출력 닫힘보다 늦음)
+	// 실행 ID → 그 실행의 상태 조회 동작. "running"(끝내 Running:true) · "404"(사라짐) · "500" · "drop"(연결 끊김) · "stall"(멈춤)
+	execInspectBehaviour map[string]string
+	execCount            int            // 만든 실행 수 — ID 는 exec-1, exec-2, …
+	execInspections      map[string]int // 실행 ID → 상태 조회 횟수
+	requests             []dockerRequest
+	releases             chan stallRelease
+	server               *httptest.Server
 }
 
 var dockerVersionPrefix = regexp.MustCompile(`^/v[0-9]+\.[0-9]+`)
 
 func newFakeDocker(t *testing.T) *fakeDocker {
-	docker := &fakeDocker{releases: make(chan stallRelease, 64)}
+	docker := &fakeDocker{releases: make(chan stallRelease, 64), execInspectBehaviour: map[string]string{}, execInspections: map[string]int{}}
 	docker.server = httptest.NewServer(http.HandlerFunc(docker.serve))
 	t.Cleanup(docker.server.Close)
 	return docker
@@ -422,11 +428,7 @@ func (docker *fakeDocker) serve(writer http.ResponseWriter, request *http.Reques
 	case request.Method == http.MethodPost && dockerExecStartPath.MatchString(path):
 		docker.serveExecStart(writer, request, path)
 	case request.Method == http.MethodGet && dockerExecInspect.MatchString(path):
-		docker.mutex.Lock()
-		exitCode := docker.gpuExitCode
-		docker.mutex.Unlock()
-		writeDockerJSON(writer, http.StatusOK, map[string]any{"ID": dockerExecInspect.FindStringSubmatch(path)[1],
-			"Running": false, "ExitCode": exitCode, "Pid": 0})
+		docker.serveExecInspect(writer, request, path, dockerExecInspect.FindStringSubmatch(path)[1])
 	default:
 		writeDockerJSON(writer, http.StatusNotFound, map[string]string{"message": "page not found"})
 	}
@@ -535,16 +537,62 @@ func (docker *fakeDocker) serveExecCreate(writer http.ResponseWriter, key string
 		writeDockerJSON(writer, status, map[string]string{"message": "container " + key + " is not running"})
 		return
 	}
-	writeDockerJSON(writer, http.StatusCreated, map[string]string{"Id": "exec0123456789"})
+	docker.mutex.Lock()
+	docker.execCount++
+	id := fmt.Sprintf("exec-%d", docker.execCount)
+	docker.mutex.Unlock()
+	writeDockerJSON(writer, http.StatusCreated, map[string]string{"Id": id})
+}
+
+// serveExecInspect — 실행의 상태. 동작은 execInspectBehaviour[id] · execRunningCount 로 정한다.
+func (docker *fakeDocker) serveExecInspect(writer http.ResponseWriter, request *http.Request, path, id string) {
+	docker.mutex.Lock()
+	docker.execInspections[id]++
+	inspections := docker.execInspections[id]
+	behaviour, exitCode, runningCount, known := docker.execInspectBehaviour[id], docker.gpuExitCode, docker.execRunningCount, id != "" && strings.HasPrefix(id, "exec-")
+	docker.mutex.Unlock()
+	switch behaviour {
+	case "404":
+		writeDockerJSON(writer, http.StatusNotFound, map[string]string{"message": "No such exec instance: " + id})
+		return
+	case "500":
+		writeDockerJSON(writer, http.StatusInternalServerError, map[string]string{"message": "fake exec inspect failure"})
+		return
+	case "stall":
+		docker.stall(request, path)
+		return
+	case "drop":
+		if hijacker, ok := writer.(http.Hijacker); ok {
+			if connection, _, err := hijacker.Hijack(); err == nil {
+				connection.Close()
+				return
+			}
+		}
+		return
+	}
+	if !known {
+		writeDockerJSON(writer, http.StatusNotFound, map[string]string{"message": "No such exec instance: " + id})
+		return
+	}
+	running := behaviour == "running" || inspections <= runningCount
+	body := map[string]any{"ID": id, "Running": running, "ExitCode": exitCode, "Pid": 4343}
+	if running {
+		body["ExitCode"] = nil // 도는 중에는 종료 코드가 없다
+	}
+	writeDockerJSON(writer, http.StatusOK, body)
 }
 
 // serveExecStart — Tty 없는 exec 의 출력은 다중화된 흐름이다: 조각마다 [흐름(1=stdout), 0, 0, 0, 길이(빅엔디언 4바이트)] + 내용.
 func (docker *fakeDocker) serveExecStart(writer http.ResponseWriter, request *http.Request, path string) {
 	docker.mutex.Lock()
-	output, stall := docker.gpuOutput, docker.stallExecStart
+	output, stall, startStatus := docker.gpuOutput, docker.stallExecStart, docker.execStartStatus
 	docker.mutex.Unlock()
 	if stall {
 		docker.stall(request, path)
+		return
+	}
+	if startStatus != 0 {
+		writeDockerJSON(writer, startStatus, map[string]string{"message": "fake exec start failure"})
 		return
 	}
 	writer.Header().Set("Content-Type", "application/vnd.docker.multiplexed-stream")

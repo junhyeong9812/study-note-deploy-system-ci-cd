@@ -90,6 +90,7 @@ type ResourceCollectorStats struct {
 	SendFailures int64 // 스트림에 넣지 못한 항목
 	Skipped      int64 // 앞 수집이 끝나지 않아 건너뛴 주기
 	Panics       int64 // 수집 · 전송 중 되살린 패닉
+	GPUSkipped   int64 // 앞 GPU 실행이 남아 있을 수 있어(도는 중 · 상태를 알 수 없음) 그 수집의 GPU 조회를 건너뛴 횟수(§12)
 	InFlight     bool  // 수집이 도는 중 — 시작부터 그 수집의 모든 일(전송 · 패닉 회복 포함)이 실제로 끝날 때까지 참
 }
 
