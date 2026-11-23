@@ -12,8 +12,21 @@ package agent
 // 조회는 busy 잠금을 잡지 않는다. 동시 조회는 두 경로를 합쳐 gitReadConcurrency 개까지, 넘으면 기다리지 않고 429.
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/junhyeong9812/study-note-deploy-system-ci-cd/internal/shared"
 )
@@ -80,12 +93,562 @@ type GitCommitDetail struct {
 	FilesTruncated bool            `json:"files_truncated"`
 }
 
+const (
+	gitCommitFormat      = "--format=%H%x00%an%x00%aI%x00%s%x00%b" // 이메일(%ae)은 읽지도 않는다
+	gitCommitFieldCount  = 5                                       // 위 형식의 칸 수 — -z 로 레코드마다 NUL 로 끝맺는다
+	gitLineCutMarker     = " …(잘림)"                                // patch 한 줄을 자른 자리
+	gitEnvelopeAllowance = 64                                      // 봉투({"data":…,"success":true}\n)가 data 에 더하는 바이트의 넉넉한 몫
+)
+
+// 조회 실패의 갈래 — 응답 코드는 이것으로만 정한다. git 의 오류 글자는 읽지 않는다(지역 설정을 탄다 — 명세 12.5).
+var (
+	errGitTimeout          = errors.New(gitCodeTimeout)
+	errCommitNotFound      = errors.New(gitCodeCommitNotFound)
+	errParentUnavailable   = errors.New(gitCodeParentUnavailable)
+	errUnexpectedGitOutput = errors.New("git 출력 형식이 예상과 다름")
+	errShallowListUnread   = errors.New("shallow 목록 읽기 실패")
+)
+
+// git 이 확정해 준 전체 SHA(SHA-1 40자 · SHA-256 64자).
+var fullCommitSha = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
+
+// gitCommandError — git 이 0 이 아닌 코드로 끝났거나 뜨지 못했다(-1). 로그에는 명령 종류와 종료 코드만 남긴다.
+type gitCommandError struct {
+	subcommand string
+	exitCode   int
+}
+
+func (failure *gitCommandError) Error() string {
+	return fmt.Sprintf("git %s exit %d", failure.subcommand, failure.exitCode)
+}
+
 // handleGitCommits — GET /agent/git/commits.
 func (agent *Agent) handleGitCommits(writer http.ResponseWriter, request *http.Request) {
-	shared.WriteFail(writer, http.StatusNotImplemented, "not_implemented", "") // TODO(task 05-a 구현 워커)
+	agent.serveGitRead(writer, request, "commits", []string{"from", "to"}, readCommitRange)
 }
 
 // handleGitCommit — GET /agent/git/commit.
 func (agent *Agent) handleGitCommit(writer http.ResponseWriter, request *http.Request) {
-	shared.WriteFail(writer, http.StatusNotImplemented, "not_implemented", "") // TODO(task 05-a 구현 워커)
+	agent.serveGitRead(writer, request, "commit", []string{"sha"}, readCommitDetail)
+}
+
+// serveGitRead — 두 조회의 공통 접수: 인증 → 입력 전체 검사 → 동시 조회 자리(기다리지 않는다) → git.
+// 틀린 입력으로는 git 을 띄우지 않는다. busy 잠금은 잡지 않는다(배포를 막지 않는다).
+func (agent *Agent) serveGitRead(writer http.ResponseWriter, request *http.Request, name string, shaFields []string,
+	read func(reader *gitReader, shas []string) (any, error)) {
+	if !shared.SecretMatches(request, agent.secret) {
+		shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")
+		return
+	}
+	query := request.URL.Query()
+	service, present := singleQueryValue(query, "service")
+	directory := agent.directories[service] // 허용 목록의 키로만 디렉터리를 고른다 — 입력 글자는 경로에 들어가지 않는다
+	if !present || directory == "" {
+		shared.WriteFail(writer, http.StatusUnprocessableEntity, gitCodeInvalidRequest, "")
+		return
+	}
+	shas := make([]string, len(shaFields))
+	for index, field := range shaFields {
+		value, present := singleQueryValue(query, field)
+		if !present || !shared.ValidCommitSha(value) {
+			shared.WriteFail(writer, http.StatusUnprocessableEntity, gitCodeInvalidRequest, "")
+			return
+		}
+		shas[index] = value
+	}
+	select {
+	case agent.gitReadSlots <- struct{}{}:
+		defer func() { <-agent.gitReadSlots }()
+	default:
+		shared.WriteFail(writer, http.StatusTooManyRequests, gitCodeTooManyRequests, "")
+		return
+	}
+
+	requestID := shared.AcceptOrIssue(request.Header.Get("X-Request-Id"))
+	ctx, cancel := context.WithTimeout(request.Context(), agent.gitTimeout)
+	defer cancel()
+	startedAt := time.Now()
+	data, err := read(&gitReader{ctx: ctx, program: agent.gitProgram, directory: directory}, shas)
+	tookMs := time.Since(startedAt).Milliseconds()
+	switch {
+	case err == nil:
+		agent.logger.Log(requestID, fmt.Sprintf("agent git %s ok %s %dms", name, service, tookMs), "info")
+		shared.WriteOK(writer, data)
+	case errors.Is(err, errCommitNotFound):
+		shared.WriteFail(writer, http.StatusNotFound, gitCodeCommitNotFound, "")
+	case errors.Is(err, errParentUnavailable):
+		shared.WriteFail(writer, http.StatusNotFound, gitCodeParentUnavailable, "")
+	case errors.Is(err, errGitTimeout):
+		agent.logger.Log(requestID, fmt.Sprintf("agent git %s timeout %s %dms", name, service, tookMs), "warning")
+		shared.WriteFail(writer, http.StatusGatewayTimeout, gitCodeTimeout, "")
+	default: // detail 은 내지 않는다 — 경로·환경이 샐 수 있다. 로그에도 명령 종류·종료 코드만.
+		agent.logger.Log(requestID, fmt.Sprintf("agent git %s failed %s %dms: %v", name, service, tookMs, err), "error")
+		shared.WriteFail(writer, http.StatusInternalServerError, gitCodeFailed, "")
+	}
+}
+
+// singleQueryValue — 칸이 정확히 하나이고 비어 있지 않을 때만 받는다(없음·빈 값·중복은 거절).
+func singleQueryValue(query map[string][]string, key string) (string, bool) {
+	values := query[key]
+	if len(values) != 1 || values[0] == "" {
+		return "", false
+	}
+	return values[0], true
+}
+
+// readCommitRange — A 다음부터 B 까지(A 제외·B 포함), git 의 순회 순서(--topo-order, B 쪽이 먼저).
+func readCommitRange(reader *gitReader, shas []string) (any, error) {
+	boundaries, err := reader.shallowBoundaries()
+	if err != nil {
+		return nil, err
+	}
+	from, err := reader.resolveCommit(shas[0])
+	if err != nil {
+		return nil, err
+	}
+	to, err := reader.resolveCommit(shas[1])
+	if err != nil {
+		return nil, err
+	}
+	result := GitCommitRange{Commits: []GitCommit{}, RangeComplete: true, Relation: gitRelationAncestor}
+	ancestor, err := reader.isAncestor(from, to)
+	if err != nil {
+		return nil, err
+	}
+	if !ancestor { // 되돌린 배포·갈라진 이력 — 목록을 만들지 않는다(어드민이 GitHub 비교로 넘긴다)
+		result.Relation = gitRelationNotAncestor
+		return result, nil
+	}
+	output, overflowed, err := reader.run("log", "--topo-order", "--no-color", "--no-show-signature", "-z", gitCommitFormat,
+		"--max-count="+strconv.Itoa(gitCommitListLimit+1), "--end-of-options", from+".."+to)
+	if err != nil {
+		return nil, err
+	}
+	commits, err := parseCommits(output, overflowed)
+	if err != nil {
+		return nil, err
+	}
+	if len(commits) > gitCommitListLimit {
+		commits = commits[:gitCommitListLimit]
+		result.Truncated = true
+	}
+	result.Truncated = result.Truncated || overflowed
+	for _, commit := range commits {
+		if boundaries[commit.Sha] { // 그 너머(부모)는 로컬에 없다 — 범위가 잘렸을 수 있다
+			result.RangeComplete = false
+		}
+	}
+	result.Commits = commits
+	return result, nil
+}
+
+// readCommitDetail — 커밋 하나와 그 첫째 부모와의 차이. 얕은 경계 커밋은 부모가 없어 틀린 diff 가 되므로 답하지 않는다.
+func readCommitDetail(reader *gitReader, shas []string) (any, error) {
+	boundaries, err := reader.shallowBoundaries()
+	if err != nil {
+		return nil, err
+	}
+	sha, err := reader.resolveCommit(shas[0])
+	if err != nil {
+		return nil, err
+	}
+	if boundaries[sha] {
+		return nil, errParentUnavailable
+	}
+	output, overflowed, err := reader.run("log", "--no-color", "--no-show-signature", "-z", gitCommitFormat,
+		"--max-count=1", "--end-of-options", sha)
+	if err != nil {
+		return nil, err
+	}
+	commits, err := parseCommits(output, overflowed)
+	if err != nil {
+		return nil, err
+	}
+	if len(commits) != 1 || commits[0].Sha != sha {
+		return nil, errUnexpectedGitOutput
+	}
+	files, filesTruncated, err := reader.fileChanges(sha)
+	if err != nil {
+		return nil, err
+	}
+	detail := GitCommitDetail{GitCommit: commits[0], Files: files, FilesTruncated: filesTruncated}
+	limitResponseSize(&detail)
+	return detail, nil
+}
+
+// gitReader — 조회 하나의 git 실행 묶음(같은 기한·같은 저장소).
+type gitReader struct {
+	ctx       context.Context
+	program   string
+	directory string
+}
+
+// gitEnvironment — 부모의 GIT_* 는 물려주지 않는다(다른 저장소·추적 파일·설정 주입 차단). 전역 설정(safe.directory)은 HOME 으로 그대로 읽는다.
+func gitEnvironment() []string {
+	environment := []string{}
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "GIT_") || strings.HasPrefix(entry, "LC_ALL=") {
+			continue
+		}
+		environment = append(environment, entry)
+	}
+	return append(environment, "LC_ALL=C", "GIT_OPTIONAL_LOCKS=0", "GIT_NO_LAZY_FETCH=1",
+		"GIT_NO_REPLACE_OBJECTS=1", "GIT_TERMINAL_PROMPT=0")
+}
+
+// run — git 을 인자 배열로(셸 없음) 돌리고 stdout 을 읽으면서 gitOutputByteLimit 을 건다. stderr 는 버린다(응답·로그에 넣지 않는다).
+// 상한을 넘으면 더 읽지 않고 프로세스를 끝낸 뒤 overflowed=true — 오류가 아니다, 호출한 쪽이 온전한 레코드까지만 쓴다.
+// 기한이 지나면 CommandContext 가 자식을 죽이고 Wait 가 끝날 때까지 기다린다(좀비를 남기지 않는다).
+func (reader *gitReader) run(subcommand string, arguments ...string) (output []byte, overflowed bool, err error) {
+	command := exec.CommandContext(reader.ctx, reader.program, append([]string{"--no-pager", subcommand}, arguments...)...)
+	command.Dir = reader.directory
+	command.Env = gitEnvironment()
+	command.WaitDelay = time.Second // 자식이 물려준 파이프를 누가 쥐고 있어도 Wait 가 끝나게
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		return nil, false, &gitCommandError{subcommand, -1}
+	}
+	if err := command.Start(); err != nil {
+		if reader.ctx.Err() != nil {
+			return nil, false, errGitTimeout
+		}
+		return nil, false, &gitCommandError{subcommand, -1}
+	}
+	output, readErr := io.ReadAll(io.LimitReader(stdout, gitOutputByteLimit+1))
+	if len(output) > gitOutputByteLimit {
+		output, overflowed = output[:gitOutputByteLimit], true
+		_ = command.Process.Kill() // 남은 출력은 버린다 — 이미 상한
+	}
+	waitErr := command.Wait()
+	if overflowed {
+		return output, true, nil
+	}
+	if waitErr != nil && reader.ctx.Err() != nil {
+		return nil, false, errGitTimeout
+	}
+	if waitErr != nil || readErr != nil {
+		exitCode := -1
+		var exitError *exec.ExitError
+		if errors.As(waitErr, &exitError) {
+			exitCode = exitError.ExitCode()
+		}
+		return nil, false, &gitCommandError{subcommand, exitCode}
+	}
+	return output, false, nil
+}
+
+// shallowBoundaries — 얕은 저장소의 경계 커밋(부모가 로컬에 없는 커밋). 얕지 않으면 빈 집합.
+// 조회마다 가장 먼저 부른다 — 디렉터리가 저장소가 아니면 여기서 git_failed 로 끝나, 뒤의 "커밋 없음(404)"과 섞이지 않는다.
+func (reader *gitReader) shallowBoundaries() (map[string]bool, error) {
+	output, _, err := reader.run("rev-parse", "--git-path", "shallow")
+	if err != nil {
+		return nil, err
+	}
+	path := strings.TrimSuffix(string(output), "\n")
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(reader.directory, path)
+	}
+	content, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return map[string]bool{}, nil
+	}
+	if err != nil {
+		return nil, errShallowListUnread
+	}
+	boundaries := map[string]bool{}
+	for _, sha := range strings.Fields(string(content)) {
+		boundaries[sha] = true
+	}
+	return boundaries, nil
+}
+
+// resolveCommit — 형식 검사를 지난 SHA 가 이 저장소의 커밋인지 확인하고 전체 SHA 로 확정한다. 뒤의 명령은 이 값만 쓴다.
+// 없음(얕은 이력 밖 포함)·커밋 아님·약식 SHA 가 모호함은 모두 0 이 아닌 종료 코드 → commit_not_found.
+func (reader *gitReader) resolveCommit(sha string) (string, error) {
+	output, _, err := reader.run("rev-parse", "--verify", "--quiet", "--end-of-options", sha+"^{commit}")
+	var commandError *gitCommandError
+	if errors.As(err, &commandError) && commandError.exitCode > 0 {
+		return "", errCommitNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	full := strings.TrimSpace(string(output))
+	if !fullCommitSha.MatchString(full) {
+		return "", errUnexpectedGitOutput
+	}
+	return full, nil
+}
+
+// isAncestor — merge-base --is-ancestor 의 종료 코드: 0 조상 · 1 조상 아님 · 그 밖 실패.
+func (reader *gitReader) isAncestor(from, to string) (bool, error) {
+	_, _, err := reader.run("merge-base", "--is-ancestor", "--end-of-options", from, to)
+	var commandError *gitCommandError
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.As(err, &commandError) && commandError.exitCode == 1:
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+// parseCommits — gitCommitFormat 과 -z 의 출력(레코드마다 칸 5개, 칸과 레코드 모두 NUL 로 끝난다).
+// 출력이 상한에서 잘렸으면 온전한 레코드까지만 쓴다. 잘리지 않았는데 칸 수가 맞지 않으면 형식 오류다.
+func parseCommits(output []byte, overflowed bool) ([]GitCommit, error) {
+	fields := strings.Split(string(output), "\x00")
+	completeFields := len(fields) - 1 // 마지막 조각은 NUL 로 끝맺지 않은 나머지
+	if !overflowed && (completeFields%gitCommitFieldCount != 0 || fields[completeFields] != "") {
+		return nil, errUnexpectedGitOutput
+	}
+	commits := []GitCommit{}
+	for start := 0; start+gitCommitFieldCount <= completeFields; start += gitCommitFieldCount {
+		record := fields[start : start+gitCommitFieldCount]
+		authoredAt, err := time.Parse(time.RFC3339, record[2])
+		if !fullCommitSha.MatchString(record[0]) || err != nil {
+			return nil, errUnexpectedGitOutput
+		}
+		subject, _ := cutBytes(record[3], gitSubjectByteLimit)
+		body, bodyTruncated := cutBytes(record[4], gitBodyByteLimit)
+		commits = append(commits, GitCommit{Sha: record[0], AuthorName: record[1],
+			AuthoredAt: authoredAt.UTC().Format(time.RFC3339), Subject: subject, Body: body, BodyTruncated: bodyTruncated})
+	}
+	return commits, nil
+}
+
+// diffArguments — 파일 목록·줄 수·patch 를 같은 옵션으로 만든다(세 출력의 파일 순서가 같아야 짝이 맞는다).
+// 병합 커밋은 첫째 부모와의 차이, 이름 바꾸기 탐지는 -M 고정, 외부 diff·textconv·색 없음.
+func diffArguments(sha string, outputOptions ...string) []string {
+	arguments := []string{"--format=", "--no-color", "--no-ext-diff", "--no-textconv", "--no-show-signature",
+		"-M", "--diff-merges=first-parent"}
+	arguments = append(arguments, outputOptions...)
+	return append(arguments, "--end-of-options", sha)
+}
+
+type rawFileEntry struct {
+	status       string
+	path         string
+	previousPath *string
+}
+
+type fileLineCount struct {
+	additions, deletions int
+	binary               bool
+}
+
+// fileChanges — 파일 경로·상태는 --raw -z 에서, 줄 수는 --numstat -z 에서, patch 는 --patch 에서 읽어 순서대로 짝짓는다.
+// 경로는 patch 머리줄에서 파싱하지 않는다(탭·줄바꿈·따옴표가 든 경로).
+func (reader *gitReader) fileChanges(sha string) ([]GitFileChange, bool, error) {
+	rawOutput, rawOverflowed, err := reader.run("show", diffArguments(sha, "-z", "--raw")...)
+	if err != nil {
+		return nil, false, err
+	}
+	entries, err := parseRawEntries(rawOutput, rawOverflowed)
+	if err != nil {
+		return nil, false, err
+	}
+	numstatOutput, numstatOverflowed, err := reader.run("show", diffArguments(sha, "-z", "--numstat")...)
+	if err != nil {
+		return nil, false, err
+	}
+	counts, err := parseNumstat(numstatOutput, numstatOverflowed)
+	if err != nil {
+		return nil, false, err
+	}
+	patchOutput, patchOverflowed, err := reader.run("show", diffArguments(sha, "--patch")...)
+	if err != nil {
+		return nil, false, err
+	}
+	patches := splitPatchSections(patchOutput, patchOverflowed)
+
+	overflowed := rawOverflowed || numstatOverflowed || patchOverflowed
+	if !overflowed && (len(entries) != len(counts) || len(entries) != len(patches)) {
+		return nil, false, errUnexpectedGitOutput
+	}
+	fileCount := min(len(entries), len(counts), len(patches))
+	filesTruncated := overflowed // 상한에서 잘렸으면 온전히 읽은 파일까지만 싣는다
+	if fileCount > gitFileLimit {
+		fileCount, filesTruncated = gitFileLimit, true
+	}
+	files := make([]GitFileChange, 0, fileCount)
+	for index := 0; index < fileCount; index++ {
+		entry, count := entries[index], counts[index]
+		file := GitFileChange{Path: entry.path, PreviousPath: entry.previousPath, Status: entry.status,
+			Additions: count.additions, Deletions: count.deletions, Binary: count.binary}
+		if !count.binary {
+			patch, patchTruncated := limitPatch(patches[index])
+			file.Patch, file.PatchTruncated = &patch, patchTruncated
+		}
+		files = append(files, file)
+	}
+	return files, filesTruncated, nil
+}
+
+// parseRawEntries — `:모드 모드 객체 객체 상태 NUL 경로 NUL [새 경로 NUL]` 의 나열.
+func parseRawEntries(output []byte, overflowed bool) ([]rawFileEntry, error) {
+	tokens := strings.Split(string(output), "\x00")
+	completeTokens := len(tokens) - 1
+	entries := []rawFileEntry{}
+	for index := 0; index < completeTokens; {
+		header := strings.Fields(tokens[index])
+		if len(header) != 5 || !strings.HasPrefix(header[0], ":") {
+			return nil, errUnexpectedGitOutput
+		}
+		statusLetter := header[4][:1]
+		pathCount := 1
+		if statusLetter == "R" || statusLetter == "C" {
+			pathCount = 2
+		}
+		if index+pathCount >= completeTokens { // 경로가 다 오지 않았다
+			if overflowed {
+				break
+			}
+			return nil, errUnexpectedGitOutput
+		}
+		entry := rawFileEntry{path: tokens[index+pathCount], status: gitFileStatusModified}
+		switch statusLetter {
+		case "A", "C":
+			entry.status = gitFileStatusAdded
+		case "D":
+			entry.status = gitFileStatusDeleted
+		case "R":
+			previousPath := tokens[index+1]
+			entry.status, entry.previousPath = gitFileStatusRenamed, &previousPath
+		}
+		entries = append(entries, entry)
+		index += 1 + pathCount
+	}
+	if !overflowed && tokens[completeTokens] != "" {
+		return nil, errUnexpectedGitOutput
+	}
+	return entries, nil
+}
+
+// parseNumstat — `더한 TAB 뺀 TAB 경로 NUL`, 이름 바꾸기는 `더한 TAB 뺀 TAB NUL 옛 경로 NUL 새 경로 NUL`. 바이너리는 "-".
+func parseNumstat(output []byte, overflowed bool) ([]fileLineCount, error) {
+	tokens := strings.Split(string(output), "\x00")
+	completeTokens := len(tokens) - 1
+	counts := []fileLineCount{}
+	for index := 0; index < completeTokens; {
+		fields := strings.SplitN(tokens[index], "\t", 3)
+		if len(fields) != 3 {
+			return nil, errUnexpectedGitOutput
+		}
+		consumed := 1
+		if fields[2] == "" { // 경로 둘이 뒤에 따로 온다
+			consumed = 3
+		}
+		if index+consumed > completeTokens {
+			if overflowed {
+				break
+			}
+			return nil, errUnexpectedGitOutput
+		}
+		count := fileLineCount{binary: fields[0] == "-" && fields[1] == "-"}
+		if !count.binary {
+			additions, additionsErr := strconv.Atoi(fields[0])
+			deletions, deletionsErr := strconv.Atoi(fields[1])
+			if additionsErr != nil || deletionsErr != nil {
+				return nil, errUnexpectedGitOutput
+			}
+			count.additions, count.deletions = additions, deletions
+		}
+		counts = append(counts, count)
+		index += consumed
+	}
+	if !overflowed && tokens[completeTokens] != "" {
+		return nil, errUnexpectedGitOutput
+	}
+	return counts, nil
+}
+
+// splitPatchSections — patch 출력을 파일마다(`diff --git ` 줄에서 시작) 나누고, 파일 머리줄을 빼고 첫 `@@` 부터만 남긴다.
+// 내용 줄은 언제나 ' '·'+'·'-'·'\' 로 시작하므로 `diff --git ` 으로 시작하는 줄은 파일 머리뿐이다.
+// 출력이 상한에서 잘렸으면 마지막 파일은 온전하다고 볼 수 없어 뺀다.
+func splitPatchSections(output []byte, overflowed bool) []string {
+	sections := []string{}
+	var current *strings.Builder
+	inHunks := false
+	for _, line := range strings.SplitAfter(string(output), "\n") {
+		if strings.HasPrefix(line, "diff --git ") {
+			if current != nil {
+				sections = append(sections, current.String())
+			}
+			current, inHunks = &strings.Builder{}, false
+			continue
+		}
+		if current == nil {
+			continue
+		}
+		if !inHunks && !strings.HasPrefix(line, "@@") {
+			continue
+		}
+		inHunks = true
+		current.WriteString(line)
+	}
+	if current != nil {
+		sections = append(sections, current.String())
+	}
+	if overflowed && len(sections) > 0 {
+		sections = sections[:len(sections)-1]
+	}
+	return sections
+}
+
+// limitPatch — patch 를 gitPatchLineLimit 줄까지, 한 줄은 gitPatchLineByteLimit 바이트까지(넘는 줄은 잘라 표시). 잘랐으면 true.
+func limitPatch(patch string) (string, bool) {
+	var builder strings.Builder
+	truncated := false
+	lineCount := 0
+	for _, line := range strings.SplitAfter(patch, "\n") {
+		if line == "" {
+			continue
+		}
+		if lineCount == gitPatchLineLimit {
+			truncated = true
+			break
+		}
+		content, ending := strings.CutSuffix(line, "\n")
+		if shortened, cut := cutBytes(content, gitPatchLineByteLimit); cut {
+			content, truncated = shortened+gitLineCutMarker, true
+		}
+		builder.WriteString(content)
+		if ending {
+			builder.WriteString("\n")
+		}
+		lineCount++
+	}
+	return builder.String(), truncated
+}
+
+// limitResponseSize — 최종 JSON 이 gitResponseByteLimit 를 넘으면 뒤 파일부터 patch 를 비우고 patch_truncated 로 알린다.
+func limitResponseSize(detail *GitCommitDetail) {
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		return
+	}
+	size := len(encoded) + gitEnvelopeAllowance
+	for index := len(detail.Files) - 1; index >= 0 && size > gitResponseByteLimit; index-- {
+		file := &detail.Files[index]
+		if file.Patch == nil || *file.Patch == "" {
+			continue
+		}
+		encodedPatch, _ := json.Marshal(*file.Patch)
+		size -= len(encodedPatch) - len(`""`)
+		emptied := ""
+		file.Patch, file.PatchTruncated = &emptied, true
+	}
+}
+
+// cutBytes — limit 바이트 이하로 자른다(UTF-8 글자 중간에서 자르지 않는다). 잘랐으면 true.
+func cutBytes(value string, limit int) (string, bool) {
+	if len(value) <= limit {
+		return value, false
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut], true
 }

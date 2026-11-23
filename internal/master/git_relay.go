@@ -12,7 +12,13 @@ package master
 //   502 agent_unreachable · 504 agent_timeout(Master.gitRelayTimeout) · 502 unexpected_response(봉투 아님 · 4MB 초과).
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/junhyeong9812/study-note-deploy-system-ci-cd/internal/shared"
@@ -28,10 +34,106 @@ const (
 
 // handleGitCommits — GET /deploys/git/commits.
 func (master *Master) handleGitCommits(writer http.ResponseWriter, request *http.Request) {
-	shared.WriteFail(writer, http.StatusNotImplemented, "not_implemented", "") // TODO(task 05-a 구현 워커)
+	master.relayGitRead(writer, request, "/agent/git/commits", []string{"from", "to"})
 }
 
 // handleGitCommit — GET /deploys/git/commit.
 func (master *Master) handleGitCommit(writer http.ResponseWriter, request *http.Request) {
-	shared.WriteFail(writer, http.StatusNotImplemented, "not_implemented", "") // TODO(task 05-a 구현 워커)
+	master.relayGitRead(writer, request, "/agent/git/commit", []string{"sha"})
+}
+
+// relayGitRead — 비밀값 → 입력 검사(틀리면 agent 를 부르지 않는다) → 그 서비스의 agent 를 GET 으로 → 상태·봉투 그대로.
+// 배포 호출(callAgent — POST·16KB)과 따로 둔다: 읽기 상한(4MB)과 기한이 다르다.
+func (master *Master) relayGitRead(writer http.ResponseWriter, request *http.Request, agentPath string, shaFields []string) {
+	if !shared.SecretMatches(request, master.secret) {
+		shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")
+		return
+	}
+	query := request.URL.Query()
+	service, present := singleQueryValue(query, "service")
+	agentURL := master.agents[service] // 허용 목록 밖이거나 agent 설정이 없는 서비스는 빈 값
+	if !present || agentURL == "" {
+		shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_request", "")
+		return
+	}
+	forwarded := url.Values{"service": {service}}
+	for _, field := range shaFields {
+		value, present := singleQueryValue(query, field)
+		if !present || !shared.ValidCommitSha(value) {
+			shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_request", "")
+			return
+		}
+		forwarded.Set(field, value)
+	}
+
+	requestID := shared.AcceptOrIssue(request.Header.Get("X-Request-Id"))
+	agentRequest, err := http.NewRequest(http.MethodGet, agentURL+agentPath+"?"+forwarded.Encode(), nil)
+	if err != nil { // AGENT_URL_<SVC> 가 URL 꼴이 아니다
+		master.relayFailed(writer, requestID, service, agentPath, http.StatusBadGateway, StageAgentUnreachable)
+		return
+	}
+	agentRequest.Header.Set(shared.SecretHeader, master.secret)
+	agentRequest.Header.Set("X-Request-Id", requestID)
+	response, err := (&http.Client{Timeout: master.gitRelayTimeout}).Do(agentRequest)
+	if err != nil {
+		if isTimeout(err) {
+			master.relayFailed(writer, requestID, service, agentPath, http.StatusGatewayTimeout, StageAgentTimeout)
+		} else {
+			master.relayFailed(writer, requestID, service, agentPath, http.StatusBadGateway, StageAgentUnreachable)
+		}
+		return
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, gitRelayResponseLimit+1))
+	if err != nil {
+		if isTimeout(err) {
+			master.relayFailed(writer, requestID, service, agentPath, http.StatusGatewayTimeout, StageAgentTimeout)
+		} else {
+			master.relayFailed(writer, requestID, service, agentPath, http.StatusBadGateway, StageUnexpectedResponse)
+		}
+		return
+	}
+	if len(responseBody) > gitRelayResponseLimit || !isAgentEnvelope(response.StatusCode, responseBody) {
+		master.relayFailed(writer, requestID, service, agentPath, http.StatusBadGateway, StageUnexpectedResponse)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.WriteHeader(response.StatusCode)
+	_, _ = writer.Write(responseBody)
+}
+
+func (master *Master) relayFailed(writer http.ResponseWriter, requestID, service, agentPath string, status int, code string) {
+	master.logger.Log(requestID, fmt.Sprintf("git relay failed %s %s: %s", service, agentPath, code), "warning")
+	shared.WriteFail(writer, status, code, "")
+}
+
+// isAgentEnvelope — 성공은 200 + success:true, 실패는 4xx·5xx + success:false + 코드. 그 밖은 agent 의 봉투로 보지 않는다.
+func isAgentEnvelope(status int, body []byte) bool {
+	var envelope struct {
+		Success *bool `json:"success"`
+		Error   struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil || envelope.Success == nil {
+		return false
+	}
+	if *envelope.Success {
+		return status == http.StatusOK
+	}
+	return status >= http.StatusBadRequest && envelope.Error.Code != ""
+}
+
+func isTimeout(err error) bool {
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
+}
+
+// singleQueryValue — 칸이 정확히 하나이고 비어 있지 않을 때만 받는다(없음·빈 값·중복은 거절).
+func singleQueryValue(query url.Values, key string) (string, bool) {
+	values := query[key]
+	if len(values) != 1 || values[0] == "" {
+		return "", false
+	}
+	return values[0], true
 }

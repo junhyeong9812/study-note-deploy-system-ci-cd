@@ -50,8 +50,9 @@ type Agent struct {
 	background        sync.WaitGroup
 
 	// git 조회(git_read.go) — 테스트가 바꾸는 이음매. gitProgram 은 실행할 git(기본 "git"), gitTimeout 은 조회 하나의 기한.
-	gitProgram string
-	gitTimeout time.Duration
+	gitProgram   string
+	gitTimeout   time.Duration
+	gitReadSlots chan struct{} // 동시 조회 자리(gitReadConcurrency 개) — 비어 있지 않으면 기다리지 않고 429
 }
 
 func New(logger *shared.Logger) *Agent {
@@ -62,7 +63,7 @@ func New(logger *shared.Logger) *Agent {
 	modes := map[string]string{}
 	slotHealthURLs := map[string]map[string]string{}
 	slotDrainURLs := map[string]map[string]string{}
-	for _, service := range []string{"front", "backend", "llm", "alert", "observe"} {
+	for _, service := range []string{"front", "backend", "llm", "alert", "observe", "admin"} {
 		if directory := os.Getenv("DEPLOY_DIR_" + strings.ToUpper(service)); directory != "" {
 			directories[service] = directory
 		}
@@ -92,7 +93,7 @@ func New(logger *shared.Logger) *Agent {
 		probeInterval: time.Second, probeBudget: 30 * time.Second,
 		drainPollInterval: 2 * time.Second, drainLimit: 3 * time.Minute, drainWaitMargin: 70 * time.Second, drainSettle: 2 * time.Second,
 		draining: map[string]chan struct{}{}, alerts: shared.NewAlertSender("ci-cd-agent", logger),
-		gitProgram: "git", gitTimeout: gitReadTimeout}
+		gitProgram: "git", gitTimeout: gitReadTimeout, gitReadSlots: make(chan struct{}, gitReadConcurrency)}
 }
 
 func (agent *Agent) Register(mux *http.ServeMux) {

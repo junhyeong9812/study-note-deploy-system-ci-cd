@@ -28,6 +28,33 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 | `GET /deploys/{request_id}` | 한 건의 상태 |
 | `GET /deploys?service=&limit=` | 이력(최신순, 기본 50·최대 200) |
 | `GET /status` | 서비스 목록 + 최근 50건(최신순, 원소는 `/deploys` 와 같은 형태) |
+| `GET /deploys/git/commits?service=&from=&to=` | 그 서비스의 agent 저장소에서 읽은 커밋 목록(from 제외 · to 포함) — 아래 "git 조회" |
+| `GET /deploys/git/commit?service=&sha=` | 커밋 하나와 파일별 diff(첫째 부모와의 차이) — 아래 "git 조회" |
+
+## git 조회 — 읽기만 (배포 상세의 커밋·diff)
+
+master 에는 저장소가 없다. master 가 입력을 검사한 뒤 그 서비스의 agent 를 불러(`GET`, 같은 비밀값, 기한 4초, 응답 4MB까지) 상태·봉투를 그대로 돌려준다.
+
+| agent API | 설명 |
+|---|---|
+| `GET /agent/git/commits?service=&from=&to=` | `{commits:[{sha, author_name, authored_at, subject, body, body_truncated}], truncated, range_complete, relation}` — `relation` 이 `ancestor` 면 from..to(to 쪽이 먼저, `--topo-order`), `not_ancestor`(되돌린 배포·갈라진 이력)면 빈 목록. `range_complete:false` 는 목록에 얕은 이력의 경계 커밋이 들어 있다는 뜻(그 너머는 로컬에 없다) |
+| `GET /agent/git/commit?service=&sha=` | 커밋 요약 + `files:[{path, previous_path, status, additions, deletions, binary, patch, patch_truncated}]`, `files_truncated` — 병합 커밋은 첫째 부모와의 차이, 바이너리는 `patch:null` |
+
+- **읽기만**: `rev-parse` · `merge-base` · `log` · `show` 만 쓴다. `fetch` · `reset` · `checkout` · `gc` 를 부르지 않고 네트워크에 나가지 않는다. 배포 잠금을 잡지 않아 배포 중에도 답한다(대신 CPU·디스크는 나눠 쓴다).
+- **입력**: `service` 는 허용 목록(`DEPLOY_DIR_<SVC>` 가 있는 서비스)만, SHA 는 소문자 16진수 7~64자만, 칸은 하나씩. SHA 는 `rev-parse --verify` 로 커밋인지 확인해 전체 SHA 로 확정한 값만 쓰고, git 에는 인자 배열로 `--end-of-options` 뒤에 넘긴다.
+- **실행 환경**: 부모의 `GIT_*` 를 물려주지 않고 `LC_ALL=C` · `GIT_OPTIONAL_LOCKS=0` · `GIT_NO_LAZY_FETCH=1` · `GIT_NO_REPLACE_OBJECTS=1` · `GIT_TERMINAL_PROMPT=0` · `--no-pager` · `--no-ext-diff --no-textconv` 로 돈다. 판정은 종료 코드로만 한다.
+- **상한**(넘으면 자르고 알린다 — 조용히 자르지 않는다): 커밋 100개(`truncated`) · 파일 100개(`files_truncated`) · 파일 하나의 patch 500줄과 한 줄 2000바이트(`patch_truncated`) · 제목 500바이트 · 본문 8KB(`body_truncated`) · git 명령 하나의 출력 2MB(온전히 읽은 커밋·파일까지만) · 응답 JSON 2MB(뒤 파일부터 patch 를 비운다) · 조회 하나 3초 · 동시 조회 2개(넘으면 기다리지 않고 429).
+- 작성자 이메일은 내지 않는다. 오류에 git 의 오류 글자·디렉터리 경로를 넣지 않는다.
+
+| 상황 | agent | master |
+|---|---|---|
+| 비밀값 틀림 | 401 `unauthorized` | 401 (자기 검사) |
+| 입력 틀림 · 허용 목록 밖 | 422 `invalid_request` | 422 (자기 검사 — agent 를 부르지 않는다. 그 서비스의 `AGENT_URL_` 이 없어도 422) |
+| SHA 가 로컬에 없음(얕은 이력 밖 포함) · 커밋 아님 · 약식 SHA 가 모호 | 404 `commit_not_found` | 그대로 |
+| 얕은 이력의 경계 커밋의 diff(부모가 로컬에 없다) | 404 `parent_unavailable` | 그대로 |
+| 동시 조회 초과 | 429 `too_many_requests` | 그대로 |
+| git 기한 초과 · git 실패 | 504 `git_timeout` · 500 `git_failed` | 그대로 |
+| agent 에 닿지 못함 · 4초 안에 답 없음 · 봉투가 아님(4MB 초과 포함) | — | 502 `agent_unreachable` · 504 `agent_timeout` · 502 `unexpected_response` |
 
 ## 대상 repo가 지켜야 할 것
 
@@ -39,7 +66,7 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 - 규약: 봉투(success/error) · 로그 `requestId:server-name:message`(stdout+Redis XADD 실패무해)
 - 가드: fail-closed 시크릿(상수시간) · 서비스/디렉토리 고정 열거 · 커밋 sha hex 검증(**master가 접수 전에**) · master 서비스별 + agent single-flight · CI 실패 시 CD 미호출 · 배포 후 헬스 확인(DEPLOY_HEALTH_*) · 이력을 기록하지 못하면 접수 거절 · http 타임아웃
 - 수용 리스크(명문화): git-pull 방식은 저장소 커밋이 compose를 바꿀 수 있다 — main의 PR 게이트·자기 소유 repo가 신뢰 경계. HMAC+타임스탬프(재전송 방지)는 후속 이슈
-- 구동: `.env` 작성 후 `docker compose up -d --build` · 테스트: `go test ./...`
+- 구동: `.env` 작성 후 `docker compose up -d --build` · 테스트: `go test ./...` 또는 `docker build --target test .`(git 조회 테스트는 실제 git 이 필요하다)
 
 
 ## 알림 서버 연동
