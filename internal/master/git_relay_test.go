@@ -352,3 +352,14 @@ func TestGitRelayAcceptsAdminService(t *testing.T) {
 	}
 	waitFinished(t, master, "gh-admin-1") // 뒤에서 도는 진행이 끝난 뒤에 정리한다
 }
+
+// agent 의 401 은 master 와 agent 의 비밀값 불일치(설정 실수) — 어드민의 비밀값이 틀린 401 과 구분해 502 agent_unauthorized.
+// 기준: requirement-spec.md §12.8 오류 사상 표의 예외.
+func TestGitRelayReportsAgentUnauthorizedAsBadGateway(t *testing.T) {
+	agent := newFakeGitAgent(t, "llm")
+	agent.respond(401, `{"success":false,"error":{"code":"unauthorized"}}`)
+	master := newTestMaster(t)
+	for _, target := range []string{relayCommitsTarget("llm", relayFromSha, relayToSha), relayCommitTarget("llm", relayToSha)} {
+		requireRelayFailure(t, relayGet(master, target), 502, "agent_unauthorized")
+	}
+}
