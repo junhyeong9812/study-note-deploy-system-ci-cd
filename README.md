@@ -117,3 +117,33 @@ docker compose stop <기준>-blue                                    # 남은 �
 - 정리 알림(`DEPLOY_DRAIN_*`)을 받은 앱은 새 일을 받지 않는다(llm 래퍼는 질문을 돌려보낸다). 그 자리를 손으로 다시 활성 자리로 돌릴 때는 컨테이너를 재기동한다: `docker compose restart <기준>-<자리>`.
 - 구 자리는 전환 뒤 reload 가 자리 잡기를 2초 기다린 다음, 남은 연결이 끝나면(최대 3분) 내려간다. 로그에 `자리 정지 보류` 가 남았으면 두 자리가 떠 있는 것이다 — 아래처럼 응답 자리를 확인하고 반대쪽을 내린다.
 - 배포가 `cd_switch` + "되돌림 미확인"/"활성 파일 복원 실패"로 끝났으면 두 자리가 모두 떠 있을 수 있다. 위 명령으로 응답 자리를 확인하고 반대쪽을 내린다. 다음 배포도 실제 응답 자리를 기준으로 정리한다.
+
+## 자원 지표 수집 (agent)
+
+agent 는 30초마다 자기 서버의 자원 값을 읽어 Redis 스트림에 항목 하나로 보낸다. 관측 서버가 그 스트림을 읽어 저장 · 임계값 판정을 한다(이 저장소는 보내는 쪽만).
+
+- **무엇을 모으나**
+  - 서버 전체: CPU 사용률(모든 코어 평균 0~100) · 부하(1분) · 메모리 사용/전체(전체 − `MemAvailable`) · 루트 디스크 사용/전체(`df` 의 Size · Used) · 네트워크 초당 수신·송신(가상 장치 `lo` · `veth*` · `br-*` · `docker*` · `cni*` · `flannel*` 제외) · 디스크 초당 읽기·쓰기(통째 디스크만 — 파티션 · `loop` · `dm-` · `md` 는 겹쳐 세지 않는다). `/proc` 와 `statfs("/")` 에서 읽는다(host 네트워크라 호스트 값 그대로).
+  - 컨테이너별: CPU 사용률(코어 하나 = 100) · 메모리 사용(사용량 − 비활성 파일 캐시, `docker stats` 와 같은 계산) · 재시작 횟수(누적) · 상태. **이 프로젝트의 컨테이너만** — compose 프로젝트 이름이 `study-note-deploy-system-` 로 시작하는 것과 `METRICS_EXTRA_CONTAINERS` 의 이름. 그 밖의 컨테이너는 조회하지도 않는다. 도커 응답에서 이름 · ID · 상태 · 숫자만 읽고 환경 변수 · 명령줄 · 라벨 값 · 주소 · 마운트는 싣지도 로그에 남기지도 않는다.
+  - GPU(`METRICS_GPU_CONTAINER` 가 있는 서버만): 사용률 · 메모리 사용/전체 · 온도 — 그 컨테이너 안에서 `nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits` 하나만 실행한다(agent 이미지에는 `nvidia-smi` 가 없다).
+- **사용률 · 초당 값은 앞 수집과의 차이**다. 간격은 단조 시계로 재고(벽시계 보정에 흔들리지 않는다), 앞 표본은 장치별 · 컨테이너 ID 별로 둔다. 첫 수집 · 누적 값이 줄어듦(재부팅 · 장치 초기화 · 제자리 재시작) · 새 장치 · 새 컨테이너 ID(배포) · 간격 2분 초과면 **그 몫만** `null`(빼고) 기준을 새로 잡는다.
+- **어디로 보내나**: 로그와 같은 Redis(`LOG_REDIS_URL`)의 스트림 `METRICS_STREAM`(기본 `metrics`).
+  ```
+  XADD metrics MAXLEN ~ 20000 * kind resource v 1 server <SERVER_NAME> at <수집 시각 epoch ms> body <JSON ≤ 64KB>
+  ```
+  `body` 의 꼴:
+  ```json
+  {"interval_ms":30001,
+   "host":{"cpu_pct":3.4,"load1":0.11,"mem_total":16000000000,"mem_used":2100000000,"disk_total":500235124736,"disk_used":80570650624,
+           "net_rx_bps":1200,"net_tx_bps":3400,"io_read_bps":0,"io_write_bps":52000},
+   "containers":[{"name":"front-app-green","id":"0123456789ab","project":"study-note-deploy-system-front",
+                  "cpu_pct":0.7,"mem_used":119000000,"restarts":0,"state":"running"}],
+   "gpus":[{"index":0,"util_pct":0,"mem_used":9437184,"mem_total":8589934592,"temp_c":28}],
+   "missing":[]}
+  ```
+  바이트 · 초당 바이트 · `restarts` · `interval_ms` · GPU `index` · `temp_c` 는 정수(초당 값은 반올림), 사용률은 소수 한 자리(서버 전체 · GPU 는 0~100). 읽지 못한 갈래는 `missing`(`host` · `containers` · `gpus`)에 이름을 넣고 빈 값으로 둔 채 나머지를 보낸다. 컨테이너 하나의 조회 실패는 그 컨테이너의 그 값만 `null`. 컨테이너가 50개를 넘거나 본문이 64KB 를 넘으면 이름순 뒤에서부터 빼고 `containers_truncated`.
+- **배포를 막지 않는다**: 수집은 배포 잠금(`busy`)을 잡지 않는 별도 흐름이다. 한 번의 수집은 전체 10초(도커 조회 4초 · GPU 명령 2초 · Redis 전송은 남은 시간 — 기한은 호출마다 넘긴다). 앞 수집이 실제로 끝나지 않았으면 다음 주기를 건너뛰고 센다(처음 1줄 로그). 수집 중의 패닉은 되살려 `error` 로그 1줄을 남기고 다음 주기가 돈다. 수집기는 경로를 더하지 않는다.
+- **도커에 보내는 요청**: `GET /containers/json?all=1` · `GET /containers/{id}/json` · `GET /containers/{id}/stats?stream=false&one-shot=true` 와, GPU 용 `POST /containers/{설정된 이름}/exec` · `POST /exec/{id}/start` · `GET /exec/{id}/json` 뿐이다(유닉스 소켓 위의 HTTP — 기존 `docker.sock` 마운트를 그대로 쓴다. 마운트를 더하지 않는다).
+- **보내지 못하면**: 횟수를 센다. 로그는 연속 실패의 처음 1줄(`warning`)과 회복한 첫 성공 1줄(`info` — 그동안 실패한 횟수)뿐이다. 기한을 넘긴 수집은 보내지 않고 실패로 센다.
+- **설정**(`.env.agent`): `LOG_REDIS_URL`(비면 수집하지 않는다 — 시작 로그 1줄) · `SERVER_NAME`(칸 `server`) · `METRICS_STREAM` · `METRICS_EXTRA_CONTAINERS`(쉼표로 나눈 이름 — compose 프로젝트가 없는 이 프로젝트의 컨테이너) · `METRICS_GPU_CONTAINER`(비면 GPU 를 모으지 않고 `gpus: []`, `missing` 에도 넣지 않는다).
+- 알려진 한계: Redis 가 닿지 않는 동안의 지표는 버려진다(다시 보내지 않는다 — 횟수만 남는다). GPU 컨테이너가 꺼져 있거나 그 안의 `nvidia-smi` 가 실패하면 그 수집의 GPU 값은 없다(`missing` 에 `gpus` — `.158` 은 컨테이너를 다시 만들기 전까지 NVML 초기화 실패). 컨테이너 CPU 사용률은 앞 수집과의 차이라 배포 직후 첫 수집은 `null` 이다. `/proc` · `statfs` 읽기는 기한으로 끊을 수 없어, 그것이 멈추면 그 수집이 끝날 때까지 다음 주기를 건너뛴다.

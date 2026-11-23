@@ -5,8 +5,14 @@ package shared
 // 외부 redis 클라이언트 없이 RESP 를 직접 쓴다.
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
 )
 
 // StreamField — 스트림 항목의 칸 하나. 순서대로 XADD 에 실린다.
@@ -32,10 +38,46 @@ func NewRedisStream(address string) *RedisStream {
 }
 
 func (redis *RedisStream) Append(ctx context.Context, stream string, maxLength int, fields []StreamField) error {
-	return errors.New("not implemented")
+	var dialer net.Dialer
+	connection, err := dialer.DialContext(ctx, "tcp", redis.address)
+	if err != nil {
+		return fmt.Errorf("redis connect: %w", err)
+	}
+	defer connection.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = connection.SetDeadline(deadline)
+	}
+	stop := context.AfterFunc(ctx, func() { connection.Close() }) // 기한 없이 취소만 되는 ctx 도 쓰기·읽기를 푼다
+	defer stop()
+
+	parts := []string{"XADD", stream, "MAXLEN", "~", strconv.Itoa(maxLength), "*"}
+	for _, field := range fields {
+		parts = append(parts, field.Name, field.Value)
+	}
+	if _, err := connection.Write([]byte(respArray(parts...))); err != nil {
+		return fmt.Errorf("redis write: %w", err)
+	}
+	reply, err := bufio.NewReader(connection).ReadString('\n')
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("redis reply: %w", ctx.Err())
+		}
+		return fmt.Errorf("redis reply: %w", err)
+	}
+	if strings.HasPrefix(reply, "-") {
+		return errors.New("redis error reply: " + strings.TrimSpace(reply[1:]))
+	}
+	return nil
 }
 
 // RedisAddress — LOG_REDIS_URL 꼴(redis://host:port)에서 host:port. 비었거나 해석할 수 없으면 "".
 func RedisAddress(rawURL string) string {
-	return ""
+	if rawURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return parsed.Host
 }

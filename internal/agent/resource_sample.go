@@ -20,7 +20,7 @@ type ResourceBody struct {
 	Missing    []string            `json:"missing"`     // 빈 경우에도 []
 }
 
-// HostResource — 서버 전체. cpu_pct 는 모든 코어 평균 0~100. 바이트 단위.
+// HostResource — 서버 전체. cpu_pct 는 모든 코어 평균 0~100(소수 한 자리). 바이트 · 초당 바이트는 정수(초당 값은 반올림).
 type HostResource struct {
 	CPUPct     *float64 `json:"cpu_pct"`
 	Load1      *float64 `json:"load1"`
@@ -28,10 +28,10 @@ type HostResource struct {
 	MemUsed    *uint64  `json:"mem_used"` // 전체 − MemAvailable
 	DiskTotal  *uint64  `json:"disk_total"`
 	DiskUsed   *uint64  `json:"disk_used"`
-	NetRxBps   *float64 `json:"net_rx_bps"`
-	NetTxBps   *float64 `json:"net_tx_bps"`
-	IOReadBps  *float64 `json:"io_read_bps"`
-	IOWriteBps *float64 `json:"io_write_bps"`
+	NetRxBps   *uint64  `json:"net_rx_bps"`
+	NetTxBps   *uint64  `json:"net_tx_bps"`
+	IOReadBps  *uint64  `json:"io_read_bps"`
+	IOWriteBps *uint64  `json:"io_write_bps"`
 }
 
 // ContainerResource — 이 프로젝트의 컨테이너 하나. cpu_pct 는 코어 하나 = 100.
@@ -51,5 +51,5 @@ type GPUResource struct {
 	UtilPct  *float64 `json:"util_pct"`
 	MemUsed  *uint64  `json:"mem_used"`  // 바이트(MiB × 1048576)
 	MemTotal *uint64  `json:"mem_total"` // 바이트
-	TempC    *float64 `json:"temp_c"`
+	TempC    *int64   `json:"temp_c"`
 }
