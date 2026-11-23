@@ -91,7 +91,7 @@ type ResourceCollectorStats struct {
 	SendFailures int64 // 스트림에 넣지 못한 항목
 	Skipped      int64 // 앞 수집이 끝나지 않아 건너뛴 주기
 	Panics       int64 // 수집 · 전송 중 되살린 패닉
-	GPUSkipped   int64 // 앞 GPU 실행이 남아 있을 수 있어(도는 중 · 상태를 알 수 없음) 그 수집의 GPU 조회를 건너뛴 횟수(§12)
+	GPUSkipped   int64 // 그 컨테이너에 도는 우리 조회 실행이 있어 그 수집의 GPU 조회를 건너뛴 횟수 — 판단할 수 없음 · 컨테이너 꺼짐은 세지 않고 결측 로그의 이유 갈래로 드러난다(§13)
 	InFlight     bool  // 수집이 도는 중 — 시작부터 그 수집의 모든 일(전송 · 패닉 회복 포함)이 실제로 끝날 때까지 참
 }
 
@@ -677,23 +677,24 @@ const mebibyte = 1048576
 
 // GPU 결측의 이유 갈래 — "GPU 결측이 이어짐" 로그에 싣는다(도커 · 명령의 글자는 싣지 않는다).
 const (
-	gpuReasonQueryRunning = "previous query still running"
-	gpuReasonCannotJudge  = "cannot judge running execs"
-	gpuReasonContainer    = "gpu container lookup failed"
-	gpuReasonCreate       = "exec create failed"
-	gpuReasonStart        = "exec start failed"
-	gpuReasonDeadline     = "deadline exceeded"
-	gpuReasonNotFinished  = "exec not finished"
-	gpuReasonExitCode     = "non-zero exit code"
-	gpuReasonOutput       = "unreadable output"
-	gpuExecListLimit      = 20                    // 컨테이너의 실행이 이보다 많으면 판단하지 않는다
-	gpuExecPollInterval   = 50 * time.Millisecond // 끝난 직후 종료 상태를 다시 묻는 간격
-	gpuMissingLogInterval = time.Hour             // GPU 결측이 이어지는 동안 로그 간격
+	gpuReasonQueryRunning        = "previous query still running"
+	gpuReasonCannotJudge         = "cannot judge running execs"
+	gpuReasonContainer           = "gpu container lookup failed"
+	gpuReasonContainerNotRunning = "gpu container not running (stopped, paused or restarting)"
+	gpuReasonCreate              = "exec create failed"
+	gpuReasonStart               = "exec start failed"
+	gpuReasonDeadline            = "deadline exceeded"
+	gpuReasonNotFinished         = "exec not finished"
+	gpuReasonExitCode            = "non-zero exit code"
+	gpuReasonOutput              = "unreadable output"
+	gpuExecListLimit             = 20                    // 컨테이너의 실행이 이보다 많으면 판단하지 않는다
+	gpuExecPollInterval          = 50 * time.Millisecond // 끝난 직후 종료 상태를 다시 묻는 간격
+	gpuMissingLogInterval        = time.Hour             // GPU 결측이 이어지는 동안 로그 간격
 )
 
 // readGPUs — 고정 명령 하나(§13 · §13.1 — 조회용 실행은 한 번에 하나. 기억하지 않고 매번 도커에게 묻는다). 전부 GPU 기한 안이다.
-//  1. GPU 컨테이너의 실행 목록(ExecIDs)과 각 실행의 상태 · 명령을 묻는다. 우리 실행 = 명령이 gpuQueryCommand 와 정확히 같은 것.
-//     도는 우리 실행이 있으면 건너뛴다(GPUSkipped). 판단할 수 없으면(조회 실패 · 명령 칸 없음/꼴 다름 · 목록 20개 초과) 만들지 않는다.
+//  1. GPU 컨테이너를 조회한다 — 돌고 있지 않으면(꺼짐 · 일시정지 · 재시작 중) 만들기 · 시작을 하나도 보내지 않고 결측. 실행 목록(ExecIDs)과 각 실행의 상태 · 명령을 묻는다. 우리 실행 = 명령이 gpuQueryCommand 와 정확히 같은 것.
+//     도는 우리 실행이 있으면 건너뛴다(GPUSkipped). 판단할 수 없으면(조회 실패 · 명령 칸 없음/꼴 다름 · 이름이 nvidia-smi 인데 인자 칸 없음/null · 목록 20개 초과) 만들지 않는다.
 //     그 사이 사라진 실행(404)은 없음이다. 다른 명령 · 끝난 실행은 막지 않는다.
 //  2. 시작 안 된 우리 실행이 있으면 그 하나를 시작하고, 없으면 새로 만든다.
 //  3. 출력이 끝나면 종료 상태를 기한 안에서 다시 묻는다. 종료 코드 ≠ 0 · 꼴 오류 · 줄 없음은 결측.
@@ -708,10 +709,14 @@ func (collector *ResourceCollector) readGPUs(parent context.Context) ([]GPUResou
 		}
 		return reason
 	}
-	ids, err := collector.docker.containerExecIDs(ctx, collector.settings.GPUContainer)
+	container, err := collector.docker.inspectGPUContainer(ctx, collector.settings.GPUContainer)
 	if err != nil {
 		return nil, failed(gpuReasonContainer)
 	}
+	if !container.running() { // 꺼짐 · 일시정지 · 재시작 중 — 만들기 · 시작을 하나도 보내지 않는다
+		return nil, gpuReasonContainerNotRunning
+	}
+	ids := container.ExecIDs
 	if len(ids) > gpuExecListLimit {
 		return nil, gpuReasonCannotJudge
 	}
@@ -721,8 +726,8 @@ func (collector *ResourceCollector) readGPUs(parent context.Context) ([]GPUResou
 		if errors.Is(err, errDockerNotFound) {
 			continue // 목록과 조회 사이에 사라졌다
 		}
-		if err != nil {
-			return nil, failed(gpuReasonCannotJudge)
+		if err != nil || (state.Entrypoint == gpuQueryCommand[0] && !state.ArgumentsKnown) {
+			return nil, failed(gpuReasonCannotJudge) // 같은 이름인데 인자 칸이 없거나 null — 우리 실행인지 알 수 없다
 		}
 		if !isGPUQueryCommand(state) {
 			continue

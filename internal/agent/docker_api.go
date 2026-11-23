@@ -167,10 +167,11 @@ func (docker *dockerAPI) startExec(ctx context.Context, id string) (string, erro
 // dockerExecState — GET /exec/{id}/json 에서 쓰는 칸. 시작 안 함 = Running:false · ExitCode:null, 끝남 = ExitCode 가 있다.
 // 명령(entrypoint · arguments)은 우리 조회 명령과 같은지 비교하는 데만 쓴다 — 싣지도 남기지도 않는다.
 type dockerExecState struct {
-	Running    bool
-	ExitCode   *int
-	Entrypoint string
-	Arguments  []string
+	Running        bool
+	ExitCode       *int
+	Entrypoint     string
+	Arguments      []string
+	ArgumentsKnown bool // 인자 칸이 있고 null 이 아니다(도커는 인자가 없는 명령에도 [] 를 준다)
 }
 
 // errDockerExecCommandUnknown — 실행 조회는 됐는데 명령 칸이 없거나 꼴이 다르다(판단할 수 없음).
@@ -195,18 +196,31 @@ func (docker *dockerAPI) inspectExec(ctx context.Context, id string) (dockerExec
 	}
 	state := dockerExecState{Running: inspect.Running, ExitCode: inspect.ExitCode, Entrypoint: *process.Entrypoint}
 	if process.Arguments != nil {
-		state.Arguments = *process.Arguments
+		state.Arguments, state.ArgumentsKnown = *process.Arguments, true
 	}
 	return state, nil
 }
 
-// containerExecIDs — 컨테이너의 실행 목록(ExecIDs — 시작 안 한 실행과 도는 실행. null 이면 빈 목록).
-func (docker *dockerAPI) containerExecIDs(ctx context.Context, containerName string) ([]string, error) {
-	var inspect struct {
-		ExecIDs []string `json:"ExecIDs"`
-	}
-	err := docker.decode(ctx, http.MethodGet, "/containers/"+url.PathEscape(containerName)+"/json", nil, &inspect)
-	return inspect.ExecIDs, err
+// dockerGPUContainer — GPU 컨테이너 조회에서 쓰는 칸: 실행 목록(ExecIDs — 시작 안 한 실행과 도는 실행. null 이면 빈 목록)과 상태.
+// 꺼진 컨테이너의 조회는 실패가 아니라 200 에 Running:false 로 온다. 일시정지는 Running:true · Paused:true.
+type dockerGPUContainer struct {
+	ExecIDs []string `json:"ExecIDs"`
+	State   struct {
+		Running    bool `json:"Running"`
+		Paused     bool `json:"Paused"`
+		Restarting bool `json:"Restarting"`
+	} `json:"State"`
+}
+
+// running — 돌고 있다(꺼짐 · 일시정지 · 재시작 중이 아니다).
+func (container dockerGPUContainer) running() bool {
+	return container.State.Running && !container.State.Paused && !container.State.Restarting
+}
+
+func (docker *dockerAPI) inspectGPUContainer(ctx context.Context, containerName string) (dockerGPUContainer, error) {
+	var container dockerGPUContainer
+	err := docker.decode(ctx, http.MethodGet, "/containers/"+url.PathEscape(containerName)+"/json", nil, &container)
+	return container, err
 }
 
 // readMultiplexedStdout — 다중화된 흐름(조각마다 8바이트 머리 [흐름, 0, 0, 0, 길이(빅엔디언 4바이트)] + 내용)에서 stdout(1)만 잇는다.
