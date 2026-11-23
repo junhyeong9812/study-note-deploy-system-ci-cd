@@ -454,3 +454,26 @@ func TestResourceGPUOtherCommandWithoutArgumentsDoesNotBlock(t *testing.T) {
 		})
 	}
 }
+
+// 컨테이너는 돌고 있는데 실행 만들기가 실패(조회와 만들기 사이에 꺼지거나 사라짐 — 실측: 409 이고 실행 기록이 생기지 않는다).
+// 그 수집의 GPU 는 결측이고, 만들기는 1건 · 시작은 0건. 한 번의 실패가 다음 수집을 막지 않는다.
+func TestResourceGPUCreateFailureOnRunningContainerIsMissingOnce(t *testing.T) {
+	for _, status := range []int{409, 404, 500} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			harness := newExecHarness(t)
+			harness.docker.set(func(docker *fakeDocker) { docker.execCreateStatus = status })
+			requireGPUMissingButOthersIntact(t, fmt.Sprintf("만들기 %d", status), harness.collect())
+			calls := gpuCalls(harness, 0)
+			if countCalls(calls, isCreate) != 1 || countCalls(calls, isStart) != 0 {
+				t.Fatalf("만들기 1건 · 시작 0건: %v", calls)
+			}
+			if total := execTotal(harness); total != 0 {
+				t.Fatalf("만들기가 실패하면 실행 기록이 늘지 않는다: %d", total)
+			}
+
+			harness.docker.set(func(docker *fakeDocker) { docker.execCreateStatus = 0 })
+			harness.clock.advance(30 * time.Second)
+			requireGPUValues(t, "만들기 실패 다음 수집", harness.collect())
+		})
+	}
+}
