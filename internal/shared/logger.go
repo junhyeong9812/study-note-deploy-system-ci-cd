@@ -3,7 +3,6 @@ package shared
 import (
 	"fmt"
 	"net"
-	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -26,12 +25,7 @@ func NewLogger() *Logger {
 	if serverName == "" {
 		serverName = "ci-" + os.Getenv("MODE")
 	}
-	redisAddress := ""
-	if rawURL := os.Getenv("LOG_REDIS_URL"); rawURL != "" {
-		if parsed, err := url.Parse(rawURL); err == nil && parsed.Host != "" {
-			redisAddress = parsed.Host
-		}
-	}
+	redisAddress := RedisAddress(os.Getenv("LOG_REDIS_URL"))
 	stream := os.Getenv("LOG_STREAM")
 	if stream == "" {
 		stream = "logs"
