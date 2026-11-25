@@ -118,7 +118,8 @@ const legacyDeploymentsSchema = `CREATE TABLE IF NOT EXISTS deployments (
 func writeLegacyDatabase(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "deploys.db")
-	database, err := sql.Open("sqlite", path)
+	// main 5314245 의 openStore 와 같은 연결 설정 — 운영의 옛 파일은 WAL 모드다
+	database, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		t.Fatal(err)
 	}

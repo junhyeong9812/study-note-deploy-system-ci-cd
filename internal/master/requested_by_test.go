@@ -3,7 +3,8 @@ package master
 // "누가 일으켰나"(requested_by) — 접수 본문의 선택 칸 · 이력의 칸 · 조회 응답의 칸 · 사람이 일으킨 접수의 알림.
 // 계약:
 //   - 본문 requested_by(선택, 글자). 없거나 null 이거나 빈 글자면 "github".
-//   - 허용: 영문자 · 숫자 · '.' '_' '@' ':' '-' 만, 1~128 바이트(예: github · admin:<계정> · admin:<계정>:incident:<id>).
+//   - 허용: 영문자 · 숫자 · '.' '_' ':' '-' 만, 1~128 바이트(예: github · admin:<계정> · admin:<계정>:incident:<id>).
+//     '@' 는 받지 않는다 — 값이 알림 제목에 실려 메신저로 그대로 가므로 @everyone 같은 전체 호출이 될 수 있다.
 //     그 밖(줄바꿈 · 제어 문자 · 공백 · ASCII 밖 글자 · 129 바이트 이상)은 422 {"error":{"code":"invalid_requested_by"}} — 접수 전에 거절.
 //   - 인증(X-Deploy-Secret)은 그대로 먼저 탄다. 접수 응답(POST /deploy)의 칸은 바뀌지 않는다.
 //   - 이력 표의 칸: requested_by TEXT NOT NULL DEFAULT 'github' — 옛 파일은 뜰 때 한 번 더한다(있으면 건너뜀), 더하지 못하면 New 가 오류.
@@ -161,7 +162,7 @@ func TestEmptyOrNullRequestedByIsRecordedAsGithub(t *testing.T) {
 func TestRequestedByValueIsRecordedAsGiven(t *testing.T) {
 	newFakeAgent(t)
 	master := newTestMaster(t)
-	for index, requestedBy := range []string{"admin:jun", "admin:jun.lee@example-1:incident:inc_42-a", "github", "admin:" + strings.Repeat("a", 122)} {
+	for index, requestedBy := range []string{"admin:jun", "admin:jun.lee-example_1:incident:inc_42-a", "github", "admin:" + strings.Repeat("a", 122)} {
 		requestID := "adm-912-" + string(rune('a'+index))
 		recorder := submitRequestedBy(t, master, requestID, requestedBy)
 		if recorder.Code != http.StatusAccepted {
@@ -196,6 +197,9 @@ func TestMalformedRequestedByIsRejectedBeforeAcceptance(t *testing.T) {
 		"non-ascii":       "admin:준",
 		"slash":           "admin:../jun",
 		"too-long":        "admin:" + strings.Repeat("a", 123), // 129 바이트
+		"at-everyone":     "admin:@everyone",
+		"at-here":         "@here",
+		"at-in-account":   "user@example",
 	}
 	for name, requestedBy := range malformed {
 		t.Run(name, func(t *testing.T) {
@@ -222,13 +226,24 @@ func TestMalformedRequestedByIsRejectedBeforeAcceptance(t *testing.T) {
 
 func TestRequestedByOfWrongTypeIsRejected(t *testing.T) {
 	master := newTestMaster(t)
-	recorder := call(master, "POST", "/deploy", `{"service":"llm","commit_sha":"`+deploySha+`","request_id":"bad-915-1","requested_by":5}`)
-	if recorder.Code != http.StatusUnprocessableEntity ||
-		!(strings.Contains(recorder.Body.String(), `"code":"invalid_request"`) || strings.Contains(recorder.Body.String(), `"code":"invalid_requested_by"`)) {
-		t.Fatalf("글자가 아닌 requested_by 가 통했다: %d %s", recorder.Code, recorder.Body.String())
-	}
-	if lookupRecorder := call(master, "GET", "/deploys/bad-915-1", ""); lookupRecorder.Code != http.StatusNotFound {
-		t.Fatalf("거절한 접수가 이력에 남았다: %d", lookupRecorder.Code)
+	for name, rawValue := range map[string]string{"number": `5`, "boolean": `true`, "object": `{"name":"admin:jun"}`, "array": `["admin:jun"]`} {
+		t.Run(name, func(t *testing.T) {
+			requestID := "bad-915-" + name
+			recorder := call(master, "POST", "/deploy", `{"service":"llm","commit_sha":"`+deploySha+`","request_id":"`+requestID+`","requested_by":`+rawValue+`}`)
+			var envelope struct {
+				Success bool `json:"success"`
+				Error   struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil || recorder.Code != http.StatusUnprocessableEntity ||
+				envelope.Success || envelope.Error.Code != "invalid_request" {
+				t.Fatalf("글자가 아닌 requested_by 는 422 invalid_request 여야 한다: %d %s", recorder.Code, recorder.Body.String())
+			}
+			if lookupRecorder := call(master, "GET", "/deploys/"+requestID, ""); lookupRecorder.Code != http.StatusNotFound {
+				t.Fatalf("거절한 접수가 이력에 남았다: %d", lookupRecorder.Code)
+			}
+		})
 	}
 }
 
@@ -406,8 +421,59 @@ func TestNewAcceptanceOnMigratedDatabaseRecordsRequestedBy(t *testing.T) {
 	}
 }
 
+// 옛 표의 파일에 저장소 여럿이 동시에 열려도(두 마스터가 함께 뜬 경우) 모두 뜬다 — 늦게 칸을 더하려던 쪽은
+// 다른 쪽이 방금 더한 칸을 보고 정상으로 뜬다. 칸은 하나, 옛 줄은 github.
+// 라운드마다 새 옛 파일을 만들고, 여는 쪽들을 한꺼번에 풀어(start 를 닫아) 칸 확인과 칸 더하기가 겹치게 한다.
+func TestConcurrentStartupsOnLegacyDatabaseAllSucceed(t *testing.T) {
+	const rounds = 30
+	const openers = 4
+	for round := 0; round < rounds; round++ {
+		path := writeLegacyDatabase(t)
+		start := make(chan struct{})
+		stores := make([]*sqliteStore, openers)
+		errs := make([]error, openers)
+		var group sync.WaitGroup
+		for opener := 0; opener < openers; opener++ {
+			group.Add(1)
+			go func(opener int) {
+				defer group.Done()
+				<-start
+				stores[opener], errs[opener] = openStore(path)
+			}(opener)
+		}
+		close(start)
+		group.Wait()
+		for opener := 0; opener < openers; opener++ {
+			if errs[opener] != nil {
+				for _, store := range stores {
+					if store != nil {
+						store.database.Close()
+					}
+				}
+				t.Fatalf("라운드 %d: 동시에 연 저장소 %d 가 뜨지 못했다: %v", round, opener, errs[opener])
+			}
+		}
+		for opener, store := range stores {
+			var columns int
+			if err := store.database.QueryRow(`SELECT count(*) FROM pragma_table_info('deployments') WHERE name = 'requested_by'`).Scan(&columns); err != nil || columns != 1 {
+				t.Fatalf("라운드 %d 저장소 %d: requested_by 칸이 하나여야 한다: %d %v", round, opener, columns, err)
+			}
+			for _, requestID := range []string{"gh-800-1", "gh-800-2"} {
+				deployment, found, err := store.Find(requestID)
+				if err != nil || !found || deployment.RequestedBy != "github" {
+					t.Fatalf("라운드 %d 저장소 %d: 옛 줄 %s 가 github 로 읽히지 않는다: %+v %v %v", round, opener, requestID, deployment, found, err)
+				}
+			}
+		}
+		for _, store := range stores {
+			store.database.Close()
+		}
+	}
+}
+
 // 칸을 더하지 못하는 실제 SQLite 상황: STRICT 표에 선언과 다른 꼴의 값이 남아 있으면 ADD COLUMN 이 거절된다
 // ("type mismatch on DEFAULT"). 지금 코드는 이 파일로 뜨고 읽는다 — 칸 더하기만 실패한다.
+// 칸 더하기가 실패한 뒤 칸이 있는지 다시 보아도 여전히 없으므로 뜨지 않아야 한다(경합의 회복이 실패를 삼키지 않는다).
 func TestStartupFailsWhenRequestedByColumnCannotBeAdded(t *testing.T) {
 	path := writeLegacyDatabase(t)
 	database, err := sql.Open("sqlite", path)
