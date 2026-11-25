@@ -34,10 +34,11 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 ### 누가 일으켰나 — `requested_by`
 
 - 접수 본문: `{"service", "commit_sha", "request_id", "requested_by"}` — `requested_by` 는 선택이다. 없거나 `null` 이거나 빈 글자면 `github`(GitHub 워크플로의 본문은 이 칸을 싣지 않는다). 사람이 일으킨 접수는 `admin:<계정>`(뒤에 `:incident:<id>` 가 붙을 수 있다).
-- 허용하는 꼴: 영문자 · 숫자 · `.` `_` `@` `:` `-` 만, 1~128바이트. 그 밖(공백 · 줄바꿈 · 제어 문자 · ASCII 밖 글자 · 129바이트 이상)은 접수 전에 422 `invalid_requested_by` — 이력에 남지 않고 agent 를 부르지 않는다. 글자가 아닌 값(숫자 등)은 422 `invalid_request`. 인증 검사가 먼저다.
+- 허용하는 꼴: 영문자 · 숫자 · `.` `_` `:` `-` 만, 1~128바이트. 그 밖(`@` · 공백 · 줄바꿈 · 제어 문자 · ASCII 밖 글자 · 129바이트 이상)은 접수 전에 422 `invalid_requested_by` — 이력에 남지 않고 agent 를 부르지 않는다. `@` 를 받지 않는 까닭: 값이 접수 알림의 제목에 실리고 알림 서버가 메신저로 그대로 보내므로 `@everyone` 같은 전체 호출이 될 수 있다. 글자가 아닌 값(숫자 · 참거짓 · 객체 · 배열)은 422 `invalid_request` 로 거절된다. 인증 검사가 먼저다.
+- 이 값은 접수 비밀값을 가진 쪽이 스스로 적는 값이다 — 증명이 아니다(`github` 를 적으면 접수 알림이 가지 않는다). master 는 글자와 길이만 보고 `admin:<계정>` 의 형태는 강제하지 않는다.
 - 접수 응답(202)의 칸은 그대로다. 조회 응답(`GET /deploys/{request_id}` · `GET /deploys` · `GET /status` 의 `history`)의 각 줄 맨 끝에 `requested_by` 가 늘 실린다. 이 칸을 더하기 전에 기록된 줄은 `github` 다.
 - 같은 `request_id` 의 재접수는 처음 접수의 `requested_by` 를 남긴다(덮어쓰지 않는다).
-- 이력 표의 칸 `requested_by TEXT NOT NULL DEFAULT 'github'` — 칸이 없는 옛 이력 파일에는 master 가 뜰 때 한 번 더한다(있으면 건너뜀). 더하지 못하면 master 가 뜨지 않는다.
+- 이력 표의 칸 `requested_by TEXT NOT NULL DEFAULT 'github'` — 칸이 없는 옛 이력 파일에는 master 가 뜰 때 한 번 더한다(있으면 건너뜀). 더하기가 실패하면 칸이 있는지 한 번 더 보고, 있으면(함께 뜬 다른 master 가 방금 더했다) 그대로 뜬다. 그래도 없으면 master 가 뜨지 않는다.
 
 ## git 조회 — 읽기만 (배포 상세의 커밋·diff)
 

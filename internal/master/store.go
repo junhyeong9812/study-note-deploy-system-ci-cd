@@ -87,17 +87,27 @@ func openStore(path string) (*sqliteStore, error) {
 // addRequestedByColumn — requested_by 이전에 만든 이력 파일에 칸을 한 번 더한다(있으면 건너뜀). 옛 줄은 기본값 github 로 읽힌다.
 // 더하지 못하면 뜨지 않는다 — 칸 없는 표로 뜨면 모든 접수의 기록이 실패한다.
 func addRequestedByColumn(database *sql.DB) error {
-	var columns int
-	if err := database.QueryRow(`SELECT count(*) FROM pragma_table_info('deployments') WHERE name = 'requested_by'`).Scan(&columns); err != nil {
+	present, err := hasRequestedByColumn(database)
+	if err != nil {
 		return fmt.Errorf("requested_by 칸 확인 실패: %w", err)
 	}
-	if columns > 0 {
+	if present {
 		return nil
 	}
-	if _, err := database.Exec(`ALTER TABLE deployments ADD COLUMN requested_by TEXT NOT NULL DEFAULT 'github'`); err != nil {
-		return fmt.Errorf("requested_by 칸 더하기 실패: %w", err)
+	if _, alterErr := database.Exec(`ALTER TABLE deployments ADD COLUMN requested_by TEXT NOT NULL DEFAULT 'github'`); alterErr != nil {
+		// 두 master 가 함께 떠 다른 쪽이 방금 칸을 더했을 수 있다 — 칸이 있으면 정상이다. 오류 글로 갈래를 나누지 않는다.
+		if presentAfterFailure, recheckErr := hasRequestedByColumn(database); recheckErr == nil && presentAfterFailure {
+			return nil
+		}
+		return fmt.Errorf("requested_by 칸 더하기 실패: %w", alterErr)
 	}
 	return nil
+}
+
+func hasRequestedByColumn(database *sql.DB) (bool, error) {
+	var columns int
+	err := database.QueryRow(`SELECT count(*) FROM pragma_table_info('deployments') WHERE name = 'requested_by'`).Scan(&columns)
+	return columns > 0, err
 }
 
 func (store *sqliteStore) Insert(deployment Deployment) error {

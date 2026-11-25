@@ -44,7 +44,8 @@ type DeployRequest struct {
 const requestedByGithub = "github"
 
 // 이력·알림에 그대로 실리는 값이라 닫힌 글자 집합만 받는다(줄바꿈·제어 문자·공백·ASCII 밖 글자 차단). 128바이트까지.
-var validRequestedBy = regexp.MustCompile(`^[A-Za-z0-9._@:-]{1,128}$`)
+// '@' 도 받지 않는다 — 값이 알림 제목에 실리고 알림 서버가 메신저로 그대로 보내므로 @everyone 같은 전체 호출이 될 수 있다.
+var validRequestedBy = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 
 type Master struct {
 	secret   string
