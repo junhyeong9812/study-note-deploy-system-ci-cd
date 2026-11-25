@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,10 +34,17 @@ const (
 var agentStages = map[string]bool{"ci_fetch": true, "ci_test": true, "ci_build": true, "cd_up": true, "cd_health": true, "cd_switch": true}
 
 type DeployRequest struct {
-	Service   string `json:"service"`
-	CommitSha string `json:"commit_sha"`
-	RequestID string `json:"request_id"`
+	Service     string `json:"service"`
+	CommitSha   string `json:"commit_sha"`
+	RequestID   string `json:"request_id"`
+	RequestedBy string `json:"requested_by"` // 선택 — 없음·null·빈 글자는 GitHub 워크플로의 접수다
 }
+
+// 누가 일으켰나 — GitHub 워크플로는 칸을 싣지 않는다. 사람이 일으킨 접수는 admin:<계정>(뒤에 :incident:<id> 가 붙을 수 있다).
+const requestedByGithub = "github"
+
+// 이력·알림에 그대로 실리는 값이라 닫힌 글자 집합만 받는다(줄바꿈·제어 문자·공백·ASCII 밖 글자 차단). 128바이트까지.
+var validRequestedBy = regexp.MustCompile(`^[A-Za-z0-9._@:-]{1,128}$`)
 
 type Master struct {
 	secret   string
@@ -119,6 +127,14 @@ func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Req
 		shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_sha", "")
 		return
 	}
+	requestedBy := deploy.RequestedBy
+	if requestedBy == "" {
+		requestedBy = requestedByGithub
+	}
+	if !validRequestedBy.MatchString(requestedBy) { // 접수 전에 거절 — 이력·알림에 남지 않는다
+		shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_requested_by", "")
+		return
+	}
 	agentURL, allowed := master.agents[deploy.Service]
 	if !allowed {
 		master.logger.Log(requestID, fmt.Sprintf("deploy rejected: unknown service %q", deploy.Service), "warning")
@@ -151,7 +167,7 @@ func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	deployment := Deployment{RequestID: requestID, Service: deploy.Service, CommitSha: deploy.CommitSha,
-		State: StateAccepted, AcceptedAt: now()}
+		State: StateAccepted, AcceptedAt: now(), RequestedBy: requestedBy}
 	if err := master.store.Insert(deployment); err != nil { // 기록 못 하는 배포는 받지 않는다
 		master.logger.Log(requestID, "deploy rejected: store write "+err.Error(), "error")
 		shared.WriteFail(writer, http.StatusInternalServerError, StageStore, "")
@@ -159,6 +175,13 @@ func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Req
 	}
 	master.inFlight[deploy.Service] = true
 	master.logger.Log(requestID, fmt.Sprintf("deploy accepted %s sha=%s", deploy.Service, deploy.CommitSha), "info")
+	if requestedBy != requestedByGithub {
+		// 사람이 일으킨 배포는 접수 때 알린다(새로 기록된 건만 — 재접수·거절은 여기에 오지 않는다).
+		// Send 는 따로 돌아 접수 응답을 기다리게 하지 않고, 실패해도 로그만 남긴다.
+		master.alerts.Send(requestID, "deploy_requested", "info", "deploy-requested:"+requestID,
+			fmt.Sprintf("배포 접수 %s — %s", deploy.Service, requestedBy),
+			fmt.Sprintf("커밋 %s", deploy.CommitSha))
+	}
 
 	go master.advance(deployment, agentURL) // 접수 즉시 202 — 결과는 GET /deploys/{request_id}
 	shared.WriteAccepted(writer, map[string]any{"request_id": requestID, "service": deploy.Service, "state": StateAccepted})

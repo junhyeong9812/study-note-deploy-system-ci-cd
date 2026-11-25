@@ -3,6 +3,7 @@ package master
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -30,6 +31,7 @@ type Deployment struct {
 	FinishedAt    string `json:"finished_at,omitempty"`
 	IntegrationMs int64  `json:"ci_ms"`
 	DeliveryMs    int64  `json:"cd_ms"`
+	RequestedBy   string `json:"requested_by"` // 누가 일으켰나 — 조회 응답의 맨 끝 칸. 접수 때 정해지고 바뀌지 않는다
 }
 
 func (deployment Deployment) finished() bool {
@@ -47,7 +49,7 @@ type deploymentStore interface {
 
 type sqliteStore struct{ database *sql.DB }
 
-const deploymentColumns = `request_id, service, commit_sha, state, failed_stage, detail, accepted_at, finished_at, ci_ms, cd_ms`
+const deploymentColumns = `request_id, service, commit_sha, state, failed_stage, detail, accepted_at, finished_at, ci_ms, cd_ms, requested_by`
 
 func openStore(path string) (*sqliteStore, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -68,9 +70,13 @@ func openStore(path string) (*sqliteStore, error) {
 		accepted_at  TEXT NOT NULL,
 		finished_at  TEXT NOT NULL DEFAULT '',
 		ci_ms        INTEGER NOT NULL DEFAULT 0,
-		cd_ms        INTEGER NOT NULL DEFAULT 0
+		cd_ms        INTEGER NOT NULL DEFAULT 0,
+		requested_by TEXT NOT NULL DEFAULT 'github'
 	);
 	CREATE INDEX IF NOT EXISTS deployments_service_accepted ON deployments(service, accepted_at);`)
+	if err == nil {
+		err = addRequestedByColumn(database)
+	}
 	if err != nil {
 		database.Close()
 		return nil, err
@@ -78,10 +84,27 @@ func openStore(path string) (*sqliteStore, error) {
 	return &sqliteStore{database: database}, nil
 }
 
+// addRequestedByColumn — requested_by 이전에 만든 이력 파일에 칸을 한 번 더한다(있으면 건너뜀). 옛 줄은 기본값 github 로 읽힌다.
+// 더하지 못하면 뜨지 않는다 — 칸 없는 표로 뜨면 모든 접수의 기록이 실패한다.
+func addRequestedByColumn(database *sql.DB) error {
+	var columns int
+	if err := database.QueryRow(`SELECT count(*) FROM pragma_table_info('deployments') WHERE name = 'requested_by'`).Scan(&columns); err != nil {
+		return fmt.Errorf("requested_by 칸 확인 실패: %w", err)
+	}
+	if columns > 0 {
+		return nil
+	}
+	if _, err := database.Exec(`ALTER TABLE deployments ADD COLUMN requested_by TEXT NOT NULL DEFAULT 'github'`); err != nil {
+		return fmt.Errorf("requested_by 칸 더하기 실패: %w", err)
+	}
+	return nil
+}
+
 func (store *sqliteStore) Insert(deployment Deployment) error {
-	_, err := store.database.Exec(`INSERT INTO deployments (`+deploymentColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+	_, err := store.database.Exec(`INSERT INTO deployments (`+deploymentColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 		deployment.RequestID, deployment.Service, deployment.CommitSha, deployment.State, deployment.FailedStage,
-		deployment.Detail, deployment.AcceptedAt, deployment.FinishedAt, deployment.IntegrationMs, deployment.DeliveryMs)
+		deployment.Detail, deployment.AcceptedAt, deployment.FinishedAt, deployment.IntegrationMs, deployment.DeliveryMs,
+		deployment.RequestedBy)
 	return err
 }
 
@@ -104,7 +127,7 @@ func scanDeployment(row rowScanner) (Deployment, error) {
 	var deployment Deployment
 	err := row.Scan(&deployment.RequestID, &deployment.Service, &deployment.CommitSha, &deployment.State,
 		&deployment.FailedStage, &deployment.Detail, &deployment.AcceptedAt, &deployment.FinishedAt,
-		&deployment.IntegrationMs, &deployment.DeliveryMs)
+		&deployment.IntegrationMs, &deployment.DeliveryMs, &deployment.RequestedBy)
 	return deployment, err
 }
 
