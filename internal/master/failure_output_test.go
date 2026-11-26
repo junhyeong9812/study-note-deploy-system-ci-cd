@@ -553,7 +553,7 @@ func TestStartupExpiresOldOutputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	old, _ := json.Marshal(map[string]any{"request_id": "gh-o15-1", "service": "llm", "commit_sha": deploySha, "failed_stage": "ci_test",
-		"recorded_at": recordedAt.Format(time.RFC3339Nano), "output": "stale-output-text", "truncated": false, "omitted_bytes": 0,
+		"recorded_at": recordedAt.Format(time.RFC3339Nano), "sequence": 1, "output": "stale-output-text", "truncated": false, "omitted_bytes": 0,
 		"bytes": 17, "redactions": map[string]int{}})
 	if err := os.WriteFile(filepath.Join(directory, "gh-o15-1.json"), old, 0o600); err != nil {
 		t.Fatal(err)

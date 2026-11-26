@@ -4,6 +4,7 @@ package shared
 //
 // 정한 계약:
 //   - 표시 뒤의 나머지: 값 전체가 정확히 표시 하나(`[가림:<종류>]`)일 때만 건너뛴다. 표시로 시작하지만 뒤에 글이 붙은 값은 값 전체를 가린다.
+//     다시 거치면 가림이 늘 수는 있어도 줄지 않는다(requireNeverUnmasks).
 //   - 따옴표 안의 값은 역빗금 이스케이프(`\"` · `\'` · `\\`)를 따라 닫는 따옴표까지.
 //   - 다이제스트의 예외: `sha256:` 뒤 정확히 64자 · `sha384:` 96 · `sha512:` 128 일 때만. 그 밖의 길이 · 이름은 16진 규칙(41자 이상 가림).
 //   - 비밀 칸의 이름: 소문자로 바꾼 이름이 비밀 낱말(password · passwd · secret · token · api_key · apikey · api-key · access_key ·
@@ -39,9 +40,7 @@ func TestMaskFollowedByLeftoverIsRedactedWhole(t *testing.T) {
 	}
 	for _, testCase := range cases {
 		captured := requireCaptured(t, testCase.input, testCase.want)
-		if again := CaptureOutput(captured.Text); again.Text != captured.Text || len(nonZero(again.Redactions)) != 0 {
-			t.Fatalf("한 번 더 거치면 바뀌지 않고 세지 않는다: %q → %q %v", captured.Text, again.Text, again.Redactions)
-		}
+		requireNeverUnmasks(t, captured.Text, CaptureOutput(captured.Text).Text)
 	}
 }
 

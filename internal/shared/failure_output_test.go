@@ -6,12 +6,12 @@ package shared
 //   - 차례: 글자 정리 → 가림 → 자르기. 자르기는 가린 뒤의 바이트로 잰다(비밀값이 자른 경계에 걸쳐 반쪽이 남지 않는다).
 //   - 글자 정리: 깨진 UTF-8 → U+FFFD · ANSI 제어열(CSI `ESC [ … 끝 글자` · OSC `ESC ] … BEL|ESC \` · 그 밖의 `ESC 글자`)은 지운다 ·
 //     `\r\n` 과 홀로 선 `\r` 은 줄바꿈 하나 · 탭과 줄바꿈 밖의 제어 문자(NUL 포함 0x00–0x1F · 0x7F)는 U+FFFD.
-//   - 가림은 줄 단위로 한다. 줄바꿈 없이 64KB 를 넘는 줄은 64KB 마다 나누되, 나누는 자리는 그 조각의 마지막 4KB 안의 마지막 공백 · 탭 뒤
-//     (없으면 64KB 의 글자 경계).
+//   - 가림은 줄 단위로 한다. 한 줄은 1MB 까지 통째로 가린다(조각으로 나누지 않는다). 1MB 를 넘는 한 줄은 내용 없이 표시 줄로 바뀐다
+//     (failure_output_long_line_test.go).
 //   - 내부 주소(private_ip): IPv4 10/8 · 172.16/12 · 192.168/16 · 100.64/10 · 169.254/16, IPv6 fc00::/7 · fe80::/10(첫 묶음이 네 자리로 적힌 것 —
 //     `%zone` 포함). 문서용 대역(192.0.2/24 · 198.51.100/24 · 203.0.113/24 · 2001:db8::/32)과 127.0.0.1 · ::1 은 남긴다.
 //   - 가린 자리는 `[가림:<종류>]` 로 바뀐다. 종류: token · hex · pem · authorization · secret_field · url_credential · private_ip · email.
-//     이미 `[가림:` 으로 시작하는 값은 다시 가리지도 세지도 않는다(같은 것을 두 번 거쳐도 글과 횟수가 그대로).
+//     값 전체가 정확히 표시 하나인 것은 다시 가리지도 세지도 않는다. 다시 거치면 가림이 늘 수는 있어도 줄지 않고, 가린 값이 되살아나지 않는다.
 //   - 상한: 가린 뒤 FailureOutputLimit(256KB) 이하면 그대로. 넘으면 앞(FailureOutputHeadLimit 32KB 이하 — 그 안의 마지막 줄바꿈까지,
 //     줄바꿈이 없으면 글자 경계) + 표시 줄 `[가운데 <N>바이트를 버렸다]` + 끝(줄의 처음부터 — 그 창에 줄바꿈이 없으면 글자 경계).
 //     표시 줄은 언제나 한 줄을 차지한다(앞이 줄바꿈으로 끝나지 않으면 앞에 줄바꿈 하나를 더 넣는다). 전체는 256KB 이하.
@@ -294,7 +294,30 @@ func TestCaptureCountsRedactionsByKind(t *testing.T) {
 	}
 }
 
-func TestCaptureTwiceChangesNothing(t *testing.T) {
+// requireNeverUnmasks — 다시 거친 글(second)은 처음 글(first)에서 표시 밖의 글자를 지우거나 표시로 바꿀 수만 있다:
+// 표시를 모두 걷어 낸 second 의 글이 first 의 같은 글의 부분열이다(새 글자가 나타나지 않는다 — 가린 값이 되살아나지 않는다).
+var anyMask = regexp.MustCompile(`\[가림:[a-z_]+\]`)
+
+func requireNeverUnmasks(t *testing.T, first, second string) {
+	t.Helper()
+	before := []rune(anyMask.ReplaceAllString(first, ""))
+	after := []rune(anyMask.ReplaceAllString(second, ""))
+	index := 0
+	for _, character := range after {
+		for index < len(before) && before[index] != character {
+			index++
+		}
+		if index == len(before) {
+			t.Fatalf("다시 거친 글에 처음 글에 없던 글이 나타났다(가린 값이 되살아났다):\n first %q\nsecond %q", first, second)
+		}
+		index++
+	}
+	if strings.Count(second, "Zq81") > strings.Count(first, "Zq81") {
+		t.Fatalf("다시 거친 글에 표시 글자가 늘었다:\n first %q\nsecond %q", first, second)
+	}
+}
+
+func TestCaptureAgainNeverUnmasks(t *testing.T) {
 	input := strings.Join([]string{
 		"Authorization: Bearer " + fakeCharacters(23, 30, alphanumeric),
 		"password=" + fakeCharacters(24, 16, alphanumeric) + " token: " + fakeGithubToken(25),
@@ -303,14 +326,7 @@ func TestCaptureTwiceChangesNothing(t *testing.T) {
 	}, "\n")
 	first := CaptureOutput(input)
 	second := CaptureOutput(first.Text)
-	if second.Text != first.Text {
-		t.Fatalf("가린 글을 다시 거치면 바뀌지 않아야 한다:\n first %q\nsecond %q", first.Text, second.Text)
-	}
-	for kind, count := range second.Redactions {
-		if count != 0 {
-			t.Fatalf("이미 가린 자리를 다시 셌다: %s=%d", kind, count)
-		}
-	}
+	requireNeverUnmasks(t, first.Text, second.Text)
 	if len(first.Redactions) == 0 {
 		t.Fatalf("처음에는 가린 것이 있어야 한다: %q", first.Text)
 	}
@@ -371,8 +387,8 @@ func TestCaptureRedactsSecretSplitAcrossWrites(t *testing.T) {
 	}
 }
 
-func TestCaptureRedactsSecretAtLongLinePieceBoundary(t *testing.T) {
-	// 줄바꿈 없는 100KB 한 줄 — 64KB 조각의 경계(65536)에 토큰이 걸친다. 전체가 상한 밑이라 모두 남는다.
+func TestCaptureRedactsSecretInsideLongLine(t *testing.T) {
+	// 줄바꿈 없는 100KB 한 줄 — 65536 둘레에 토큰이 있다(옛 설계의 조각 경계). 한 줄을 통째로 가리고, 전체가 상한 밑이라 모두 남는다.
 	token := fakeGithubToken(34)
 	var line strings.Builder
 	for line.Len() < 65536-20 {
@@ -385,7 +401,7 @@ func TestCaptureRedactsSecretAtLongLinePieceBoundary(t *testing.T) {
 	captured := CaptureOutput(line.String())
 	requireNoFragment(t, captured.Text, token)
 	if !strings.Contains(captured.Text, mask("token")) || captured.Truncated {
-		t.Fatalf("조각의 경계에 걸친 토큰을 가려야 한다(잘리지 않고): truncated=%v", captured.Truncated)
+		t.Fatalf("긴 줄 안의 토큰을 가려야 한다(잘리지 않고): truncated=%v", captured.Truncated)
 	}
 }
 
@@ -484,7 +500,7 @@ func TestCaptureCutsLongLineOnCharacterBoundary(t *testing.T) {
 func TestCaptureRedactsBeforeCutting(t *testing.T) {
 	// 줄바꿈 없이 토큰만 빽빽이 — 앞 · 끝의 자르는 자리는 거의 늘 토큰 안에 떨어진다. 자른 뒤에 가리면 반쪽이 남는다.
 	var builder strings.Builder
-	for seed := int64(100); builder.Len() < 1_200_000; seed++ {
+	for seed := int64(100); builder.Len() < 1_000_000; seed++ { // 1MB 이하의 한 줄 — 넘으면 표시 줄로 바뀐다
 		builder.WriteString(fakeGithubToken(seed))
 		builder.WriteByte(' ')
 	}

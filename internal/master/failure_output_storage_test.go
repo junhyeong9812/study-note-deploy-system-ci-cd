@@ -4,14 +4,11 @@ package master
 //
 // 정한 계약:
 //   - 가림이 오래 걸리지 않는다: 최악 입력 1MB 의 실패도 10초(-race 에서는 4배) 안에 기록되고 조회된다(agent 를 믿지 않고 master 가 다시 가리는 길).
-//   - 시계: 방금 남긴 출력은 그 정리에서 지우지 않는다 · 파일의 미래 시각(recorded_at · expired_at)은 지금으로 친다 —
-//     시계가 뒤로 가거나 앞으로 튀었다 돌아와도 방금 남긴 것은 200, 정리는 멈추지 않는다. 14일 · 50건 · 90일은 그대로.
+//   - 시계: failure_output_sequence_test.go(§18 — 순서는 저장 번호, 기한은 적힌 시각).
 //   - 폴더: 이미 있는 저장 폴더도 master 가 뜰 때 0700 으로 맞춘다.
 //   - 임시 파일: 저장 폴더의 `.<요청 ID>.json.<무엇이든>.tmp` 가운데 수정 시각이 1시간 넘은 것은 정리 때 지운다(방금 것 · 그 꼴이 아닌 숨김 파일은 그대로).
 
 import (
-	"encoding/json"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,76 +63,7 @@ func TestStoredFileHasNoLeftoverAfterMask(t *testing.T) {
 	}
 }
 
-// ---- 4. 시계 ----
-
-func TestClockGoingBackKeepsTheJustSavedOutput(t *testing.T) {
-	agent := newOutputAgent(t)
-	master, directory, clock := newOutputMaster(t)
-	for index := range 50 {
-		failDeployment(t, master, agent, "gh-s3-"+itoa(index), outputScript{path: "/agent/ci", code: "ci_test", detail: "tail", output: rawOutput("before " + itoa(index))})
-		clock.Advance(time.Second)
-	}
-	clock.Advance(-time.Hour) // 시계 맞춤 — 앞의 50건이 모두 미래가 된다
-	failDeployment(t, master, agent, "gh-s3-new", outputScript{path: "/agent/ci", code: "ci_test", detail: "tail", output: rawOutput("just saved")})
-	if record := decodeOutputRecord(t, lookupOutput(master, "gh-s3-new")); record.Output != "just saved" {
-		t.Fatalf("방금 남긴 출력이 남아야 한다: %+v", record)
-	}
-	if count := filesWithOutput(t, directory); count != 50 {
-		t.Fatalf("50건은 그대로 지킨다: %d", count)
-	}
-	served := 0 // 미래 시각의 출력은 지금으로 친다 — 조회가 "지운 것"으로 답하지 않는다(51건이라 하나만 빠진다)
-	for index := range 50 {
-		if recorder := lookupOutput(master, "gh-s3-"+itoa(index)); recorder.Code == http.StatusOK {
-			served++
-		} else {
-			requireFailure(t, recorder, http.StatusGone, "output_expired")
-		}
-	}
-	if served != 49 {
-		t.Fatalf("앞의 50건 가운데 49건이 남아야 한다: %d", served)
-	}
-}
-
-func TestFutureDatedFileDoesNotStopRetention(t *testing.T) {
-	agent := newOutputAgent(t)
-	master, directory, clock := newOutputMaster(t)
-	failDeployment(t, master, agent, "gh-s4-old", outputScript{path: "/agent/ci", code: "ci_test", detail: "tail", output: rawOutput("old-output-text")})
-	future, _ := json.Marshal(map[string]any{"request_id": "gh-s4-future", "service": "llm", "commit_sha": deploySha, "failed_stage": "ci_test",
-		"recorded_at": clockStart.Add(100 * 24 * time.Hour).Format(time.RFC3339Nano), "output": "future-output-text", "truncated": false,
-		"omitted_bytes": 0, "bytes": 18, "redactions": map[string]int{}}) // 시계가 앞으로 튀었을 때 남은 파일
-	if err := os.WriteFile(filepath.Join(directory, "gh-s4-future.json"), future, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(15 * 24 * time.Hour)
-	failDeployment(t, master, agent, "gh-s4-new", outputScript{path: "/agent/ci", code: "ci_test", detail: "tail", output: rawOutput("new-output-text")})
-	decodeOutputRecord(t, lookupOutput(master, "gh-s4-new"))
-	requireFailure(t, lookupOutput(master, "gh-s4-old"), http.StatusGone, "output_expired")
-	if fields := storedFile(t, directory, "gh-s4-old"); fields["output"] != nil {
-		t.Fatal("미래 시각의 파일이 있어도 14일이 지난 출력은 정리된다")
-	}
-	if fields := storedFile(t, directory, "gh-s4-future"); fields["output"] == nil {
-		t.Fatal("미래 시각의 출력은 지금으로 친다 — 지우지 않는다")
-	}
-	clock.Advance(14*24*time.Hour + time.Second) // 미래 시각을 "지금"으로 친 것이 영원히 남는다는 뜻은 아니다 — 시각이 지나면 규칙대로
-	failDeployment(t, master, agent, "gh-s4-later", outputScript{path: "/agent/ci", code: "ci_test", detail: "tail", output: rawOutput("later")})
-	decodeOutputRecord(t, lookupOutput(master, "gh-s4-later"))
-	requireFailure(t, lookupOutput(master, "gh-s4-new"), http.StatusGone, "output_expired")
-}
-
-func TestFutureDatedMarkerIsKeptAsExpired(t *testing.T) {
-	agent := newOutputAgent(t)
-	master, directory, clock := newOutputMaster(t)
-	failDeployment(t, master, agent, "gh-s5-1", outputScript{path: "/agent/ci", code: "ci_test", detail: "tail", output: rawOutput("x")})
-	marker, _ := json.Marshal(map[string]any{"request_id": "gh-s5-1", "failed_stage": "ci_test", "recorded_at": clockStart.Format(time.RFC3339Nano),
-		"expired_at": clockStart.Add(200 * 24 * time.Hour).Format(time.RFC3339Nano)})
-	os.WriteFile(filepath.Join(directory, "gh-s5-1.json"), marker, 0o600)
-	clock.Advance(time.Hour)
-	failDeployment(t, master, agent, "gh-s5-2", outputScript{path: "/agent/ci", code: "ci_test", detail: "tail", output: rawOutput("y")})
-	requireFailure(t, lookupOutput(master, "gh-s5-1"), http.StatusGone, "output_expired")
-	if _, err := os.Stat(filepath.Join(directory, "gh-s5-1.json")); err != nil {
-		t.Fatalf("미래에 지운 표지는 지금 지운 것으로 친다 — 남는다: %v", err)
-	}
-}
+// ---- 4. 시계 — failure_output_sequence_test.go(§18 의 2: 보관의 순서는 저장 번호로) ----
 
 // ---- 9. 폴더와 임시 파일 ----
 
