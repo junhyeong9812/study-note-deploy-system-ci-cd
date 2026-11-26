@@ -53,7 +53,7 @@ func main() {
 	logger.Log("boot", "listening :"+port+" mode="+mode, "info")
 	server := &http.Server{ // 자원 보호 타임아웃 (리뷰 F9)
 		Addr:              ":" + port,
-		Handler:           mux,
+		Handler:           shared.TrackRequests(logger, mux), // 모든 응답에 추적 ID(X-Request-Id) — 경로가 없는 404 도
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       60 * time.Second,

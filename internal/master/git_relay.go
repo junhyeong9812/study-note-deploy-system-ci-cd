@@ -69,14 +69,14 @@ func (master *Master) relayGitRead(writer http.ResponseWriter, request *http.Req
 		forwarded.Set(field, value)
 	}
 
-	requestID := shared.AcceptOrIssue(request.Header.Get("X-Request-Id"))
+	requestID := shared.TrackingID(request.Context()) // 들어온 요청 때문에 부르는 호출 — 그 요청의 추적 ID(판정한 값)를 싣는다
 	agentRequest, err := http.NewRequest(http.MethodGet, agentURL+agentPath+"?"+forwarded.Encode(), nil)
 	if err != nil { // AGENT_URL_<SVC> 가 URL 꼴이 아니다
 		master.relayFailed(writer, requestID, service, agentPath, http.StatusBadGateway, StageAgentUnreachable)
 		return
 	}
 	agentRequest.Header.Set(shared.SecretHeader, master.secret)
-	agentRequest.Header.Set("X-Request-Id", requestID)
+	agentRequest.Header.Set(shared.RequestIDHeader, requestID)
 	response, err := (&http.Client{Timeout: master.gitRelayTimeout}).Do(agentRequest)
 	if err != nil {
 		if isTimeout(err) {

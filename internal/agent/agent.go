@@ -107,6 +107,12 @@ func (agent *Agent) Register(mux *http.ServeMux) {
 // handleStage — CI·CD 공통 접수: 인증 → 서비스·sha 검증 → 한 번에 하나 → 실행 → 실패 단계를 코드로 응답.
 func (agent *Agent) handleStage(name string, execute func(service, commitSha string) (string, error)) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
+		// 추적의 ID 와 일의 ID 를 잇는 줄 하나(추적의 ID 로) — 일의 ID 를 정하기 전에 끝나면 job=invalid. 그 밖의 줄은 지금처럼 일의 ID 로 남는다
+		recorder, job := shared.RecordStatus(writer), "invalid"
+		writer = recorder
+		defer func() {
+			agent.logger.Log(shared.TrackingID(request.Context()), fmt.Sprintf("agent %s job=%s -> %d", name, job, recorder.Status()), "info")
+		}()
 		if !shared.SecretMatches(request, agent.secret) {
 			shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")
 			return
@@ -122,6 +128,7 @@ func (agent *Agent) handleStage(name string, execute func(service, commitSha str
 			return
 		}
 		requestID := shared.AcceptOrIssue(payload.RequestID)
+		job = requestID
 		if _, allowed := agent.directories[payload.Service]; !allowed {
 			shared.WriteFail(writer, http.StatusUnprocessableEntity, "unknown_service", payload.Service)
 			return
