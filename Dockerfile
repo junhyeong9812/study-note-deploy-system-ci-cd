@@ -9,6 +9,8 @@ RUN CGO_ENABLED=0 go build -o /ci-cd ./cmd/server
 # 테스트 단계 — `docker build --target test .`. git 조회 테스트는 실제 git 저장소를 만들어 돈다(git 이 없으면 실패한다).
 FROM build AS test
 RUN apk add --no-cache git
+# 배포 대상의 목록을 코드와 견주는 시험(internal/master/service_documents_test.go)이 이 셋을 읽는다
+COPY README.md .env.example docker-compose.yml ./
 RUN go vet ./... && go test ./...
 
 FROM docker:27-cli

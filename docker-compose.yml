@@ -33,6 +33,7 @@ services:
       - ${HOME}/study-note-deploy-system-alert:${HOME}/study-note-deploy-system-alert
       - ${HOME}/study-note-deploy-system-observe:${HOME}/study-note-deploy-system-observe
       - ${HOME}/study-note-deploy-system-admin:${HOME}/study-note-deploy-system-admin
+      - ${HOME}/study-note-deploy-system-claude:${HOME}/study-note-deploy-system-claude
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:15001/health"]
       interval: 30s
