@@ -211,8 +211,10 @@ func (master *Master) advance(deployment Deployment, agentURL string) {
 	// 여기서 한 번 가려(agent 가 가렸어도 — 옛 agent 는 가리지 않는다) 이력 · 알림의 몸 · 로그의 끝을 그 가린 글에서 뗀다.
 	fail := func(stage, detail string) {
 		historyTail, alertTail, logTail := shared.DetailRedactionFailed, shared.DetailRedactionFailed, shared.DetailRedactionFailed
-		if masked, redacted := shared.RedactSafely(master.redact, detail); redacted {
+		if masked, redacted, panicReason := shared.RedactSafely(master.redact, detail); redacted {
 			historyTail, alertTail, logTail = shared.CutTail(masked.Text, detailLimit), shared.CutTail(masked.Text, 800), shared.CutTail(masked.Text, 200)
+		} else {
+			master.logger.Log(deployment.RequestID, "redaction panicked: "+panicReason, "error")
 		}
 		deployment.State, deployment.FailedStage = StateFailed, stage
 		deployment.Detail, deployment.FinishedAt = historyTail, now()

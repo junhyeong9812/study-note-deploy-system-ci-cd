@@ -96,12 +96,16 @@ func (master *Master) keepFailureOutput(deployment Deployment, stage, detail str
 	if !agentStages[stage] {
 		return
 	}
+	if agentOutput == nil && detail == shared.DetailRedactionFailed { // agent 의 가림이 실패했다 — 그 고정 글은 출력이 아니다
+		return
+	}
 	source := detail // 옛 agent — 끝 2000바이트뿐이다
 	if agentOutput != nil && agentOutput.Text != "" {
 		source = agentOutput.Text
 	}
-	captured, redacted := shared.RedactSafely(master.redact, source)
+	captured, redacted, panicReason := shared.RedactSafely(master.redact, source)
 	if !redacted { // 가리지 못한 글은 남기지 않는다
+		master.logger.Log(deployment.RequestID, "redaction panicked: "+panicReason, "error")
 		master.logger.Log(deployment.RequestID, "failure output not saved: redaction failed", "warning")
 		return
 	}

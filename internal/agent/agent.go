@@ -151,9 +151,11 @@ func (agent *Agent) handleStage(name string, execute func(service, commitSha str
 				stage, detail = staged.stage, staged.output
 			}
 			// 실패 글은 한 번 가리고, detail · 로그의 끝 · 청한 경우의 output 은 모두 그 가린 글에서 뗀다(청하지 않아도 가린다)
-			masked, redacted := shared.RedactSafely(agent.redact, detail)
+			masked, redacted, panicReason := shared.RedactSafely(agent.redact, detail)
 			detailTail, logTail := shared.DetailRedactionFailed, shared.DetailRedactionFailed
-			if redacted {
+			if !redacted {
+				agent.logger.Log(requestID, "redaction panicked: "+panicReason, "error")
+			} else {
 				detailTail, logTail = shared.CutTail(masked.Text, outputTailLimit), shared.CutTail(masked.Text, 200)
 			}
 			agent.logger.Log(requestID, fmt.Sprintf("agent %s failed %s stage=%s %dms: %s", name, payload.Service, stage, tookMs, logTail), "error")
