@@ -10,6 +10,7 @@ package agent
 //   - 바깥(git 명령 — GitHub)과 도커 API 에는 싣지 않는다.
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -366,5 +367,40 @@ func TestTrackingIDIsNotSentOutside(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("도커 대역에 요청이 오지 않았다")
+	}
+}
+
+// 배포 단계가 응답을 쓰기 전에 panic 하면 에이전트의 잇는 줄은 "-> none" 이다. panic 은 막지 않는다.
+func TestAgentStageLinkingLineSaysNoneWhenStagePanicsBeforeWriting(t *testing.T) {
+	t.Setenv("SERVER_NAME", "ci-agent")
+	agent := newPipelineAgent(t, &recordedCommands{})
+	agent.run = func(context.Context, string, []string, ...string) (string, error) { panic("runner exploded") }
+	mux := http.NewServeMux()
+	agent.Register(mux)
+	handler := shared.TrackRequests(agent.logger, mux)
+	request := httptest.NewRequest("POST", "/agent/ci", strings.NewReader(stageBody(`,"request_id":"gh-pn-9"`)))
+	request.RemoteAddr = "127.0.0.1:40000"
+	request.Header.Set(shared.SecretHeader, "test-value")
+	request.Header.Set(shared.RequestIDHeader, "trace-master-1401")
+	recorder := httptest.NewRecorder()
+	var escaped any
+	logged := captureStandardOutput(t, func() {
+		defer func() { escaped = recover() }()
+		handler.ServeHTTP(recorder, request)
+	})
+	if escaped != "runner exploded" {
+		t.Fatalf("panic 이 그대로 올라가야 한다: %v", escaped)
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("panic 대신 응답을 썼다: %d %q", recorder.Code, recorder.Body.String())
+	}
+	want := "trace-master-1401:ci-agent:agent ci job=gh-pn-9 -> none"
+	if lines := agentLinesMatching(logged, regexp.MustCompile(`^trace-master-1401:`)); len(lines) != 1 || lines[0] != want {
+		t.Fatalf("잇는 줄 %q 하나여야 한다: %q\n%s", want, lines, logged)
+	}
+	if agent.busy.TryLock() {
+		agent.busy.Unlock()
+	} else {
+		t.Fatal("panic 뒤에 작업 잠금이 풀리지 않았다")
 	}
 }

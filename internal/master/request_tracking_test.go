@@ -485,24 +485,32 @@ func TestGitRelayFailureLogUsesTheResponsesTrackingID(t *testing.T) {
 	}
 }
 
-func TestDeploymentLookupsLinkTrackingIDAndPathJobID(t *testing.T) {
+// 조회의 잇는 줄은 실패했을 때만(응답이 2xx 가 아닐 때 — 쓰지 않고 끝난 none 포함). GitHub 워크플로가 상태를 10초마다 조회하므로
+// 성공한 조회마다 줄을 남기면 배포 하나에 수십 · 수백 줄이 된다. 응답 머리글 X-Request-Id 는 늘 그대로다.
+func TestDeploymentLookupsLinkTrackingIDOnlyWhenTheyFail(t *testing.T) {
 	t.Setenv("SERVER_NAME", "ci-master")
-	newFakeAgent(t)
-	master := newTestMaster(t)
-	if recorder := submit(master, "gh-66-1"); recorder.Code != 202 {
+	agent := newOutputAgent(t)
+	master, _, _ := newOutputMaster(t)
+	failDeployment(t, master, agent, "gh-66-1", outputScript{path: "/agent/ci", code: "ci_test", detail: "tail", output: rawOutput("output of ci_test")})
+	agent.script("llm", outputScript{})
+	if recorder := submitService(master, "llm", "gh-66-2"); recorder.Code != 202 {
 		t.Fatalf("준비 접수: %d %s", recorder.Code, recorder.Body.String())
 	}
-	waitSettled(t, master, "gh-66-1")
+	if deployment := waitSettled(t, master, "gh-66-2"); deployment.State != StateSucceeded {
+		t.Fatalf("준비: 성공해야 한다: %+v", deployment)
+	}
 	cases := []struct {
 		target, secret, trace string
 		status                int
-		want                  string
+		want                  string // 빈 값 = 잇는 줄 없음
 	}{
-		{"/deploys/gh-66-1", "test-value", "trace-front-1201", 200, "deploy status job=gh-66-1 -> 200"},
+		{"/deploys/gh-66-1", "test-value", "trace-front-1201", 200, ""},
+		{"/deploys/gh-66-2", "test-value", "trace-front-1209", 200, ""},
 		{"/deploys/gh-none", "test-value", "trace-front-1202", 404, "deploy status job=gh-none -> 404"},
 		{"/deploys/bad.MARKER", "test-value", "trace-front-1203", 404, "deploy status job=invalid -> 404"},
 		{"/deploys/gh-66-1", "", "trace-front-1204", 401, "deploy status job=gh-66-1 -> 401"},
-		{"/deploys/gh-66-1/output", "test-value", "trace-front-1205", 409, "deploy output job=gh-66-1 -> 409"},
+		{"/deploys/gh-66-1/output", "test-value", "trace-front-1210", 200, ""},
+		{"/deploys/gh-66-2/output", "test-value", "trace-front-1205", 409, "deploy output job=gh-66-2 -> 409"},
 		{"/deploys/bad.MARKER/output", "test-value", "trace-front-1206", 422, "deploy output job=invalid -> 422"},
 		{"/deploys/gh-none/output", "test-value", "trace-front-1207", 404, "deploy output job=gh-none -> 404"},
 		{"/deploys/gh-66-1/output", "", "trace-front-1208", 401, "deploy output job=gh-66-1 -> 401"},
@@ -515,12 +523,60 @@ func TestDeploymentLookupsLinkTrackingIDAndPathJobID(t *testing.T) {
 		if recorder.Code != testCase.status || recorder.Result().Header.Get(shared.RequestIDHeader) != testCase.trace {
 			t.Fatalf("%s: %d %q (기대 %d %q)", testCase.target, recorder.Code, recorder.Result().Header.Get(shared.RequestIDHeader), testCase.status, testCase.trace)
 		}
-		want := testCase.trace + ":ci-master:" + testCase.want
-		if lines := linesMatching(logged, regexp.MustCompile(`^`+testCase.trace+`:`)); len(lines) != 1 || lines[0] != want {
+		lines := linesMatching(logged, regexp.MustCompile(`^`+testCase.trace+`:`))
+		if testCase.want == "" {
+			if len(lines) != 0 || strings.Contains(logged, "deploy status job=") || strings.Contains(logged, "deploy output job=") {
+				t.Fatalf("%s: 성공한 조회(%d)에는 잇는 줄이 없어야 한다: %q\n%s", testCase.target, testCase.status, lines, logged)
+			}
+		} else if want := testCase.trace + ":ci-master:" + testCase.want; len(lines) != 1 || lines[0] != want {
 			t.Fatalf("%s: 잇는 줄 %q 하나여야 한다: %q\n%s", testCase.target, want, lines, logged)
 		}
 		if strings.Contains(logged, "MARKER") {
 			t.Fatalf("%s: 꼴 밖의 경로 글자가 로그에 실렸다:\n%s", testCase.target, logged)
+		}
+	}
+}
+
+// panickingStore — Find 가 panic 한다(핸들러가 응답을 쓰기 전에 죽는 경우를 만드는 이음매).
+type panickingStore struct {
+	deploymentStore
+}
+
+func (panickingStore) Find(string) (Deployment, bool, error) { panic("store exploded") }
+
+// 핸들러가 응답을 쓰기 전에 panic 하면 잇는 줄은 "-> none" 이다(200 으로 적지 않는다). panic 은 막지 않고 그대로 올라간다.
+func TestLinkingLinesSayNoneWhenHandlerPanicsBeforeWriting(t *testing.T) {
+	t.Setenv("SERVER_NAME", "ci-master")
+	newFakeAgent(t)
+	master := newTestMaster(t)
+	master.store = panickingStore{deploymentStore: master.store}
+	mux := http.NewServeMux()
+	master.Register(mux)
+	handler := shared.TrackRequests(master.logger, mux)
+	for _, sent := range []struct{ method, target, body, trace, want string }{
+		{"POST", "/deploy", `{"service":"llm","commit_sha":"` + deploySha + `","request_id":"gh-pn-1"}`, "trace-front-1301", "deploy accept job=gh-pn-1 -> none"},
+		{"GET", "/deploys/gh-pn-2", "", "trace-front-1302", "deploy status job=gh-pn-2 -> none"},
+		{"GET", "/deploys/gh-pn-3/output", "", "trace-front-1303", "deploy output job=gh-pn-3 -> none"},
+	} {
+		request := httptest.NewRequest(sent.method, sent.target, strings.NewReader(sent.body))
+		request.RemoteAddr = "10.0.0.1:40000"
+		request.Header.Set(shared.SecretHeader, "test-value")
+		request.Header.Set(shared.RequestIDHeader, sent.trace)
+		recorder := httptest.NewRecorder()
+		var escaped any
+		logged := captureMasterLog(t, func() {
+			defer func() { escaped = recover() }()
+			handler.ServeHTTP(recorder, request)
+		})
+		if escaped != "store exploded" {
+			t.Fatalf("%s %s: panic 이 그대로 올라가야 한다: %v", sent.method, sent.target, escaped)
+		}
+		if recorder.Body.Len() != 0 {
+			t.Fatalf("%s %s: panic 대신 응답을 썼다: %d %q", sent.method, sent.target, recorder.Code, recorder.Body.String())
+		}
+		want := sent.trace + ":ci-master:" + sent.want
+		if lines := linesMatching(logged, regexp.MustCompile(`^`+sent.trace+`:`)); len(lines) != 1 || lines[0] != want {
+			t.Fatalf("%s %s: 쓰지 않고 끝난 요청의 잇는 줄 %q 하나여야 한다: %q\n%s", sent.method, sent.target, want, lines, logged)
 		}
 	}
 }

@@ -432,3 +432,39 @@ func TestAlertSenderFailureLogKeepsCallerLogID(t *testing.T) {
 	}
 	t.Fatalf("보내지 못한 줄이 Send 의 첫 인자로 남아야 한다: %q", redis.received())
 }
+
+// StatusRecorder — 잇는 줄의 "-> <상태>" 를 정한다: 아무것도 쓰지 않았으면 none, Write 만 했으면 200(net/http 가 200 을 내므로),
+// WriteHeader 를 불렀으면 그 첫 상태. 안의 writer 에는 그대로 넘긴다.
+func TestStatusRecorderOutcome(t *testing.T) {
+	untouched := RecordStatus(httptest.NewRecorder())
+	if got := untouched.Outcome(); got != "none" {
+		t.Fatalf("아무것도 쓰지 않았으면 none: %q", got)
+	}
+
+	inner := httptest.NewRecorder()
+	writeOnly := RecordStatus(inner)
+	io.WriteString(writeOnly, "body")
+	if got := writeOnly.Outcome(); got != "200" || inner.Code != 200 || inner.Body.String() != "body" {
+		t.Fatalf("Write 만 했으면 200: %q (안 %d %q)", got, inner.Code, inner.Body.String())
+	}
+
+	inner = httptest.NewRecorder()
+	headerThenWrite := RecordStatus(inner)
+	headerThenWrite.WriteHeader(http.StatusNotFound)
+	io.WriteString(headerThenWrite, "missing")
+	if got := headerThenWrite.Outcome(); got != "404" || inner.Code != 404 || inner.Body.String() != "missing" {
+		t.Fatalf("WriteHeader(404) 뒤 Write 면 404: %q (안 %d %q)", got, inner.Code, inner.Body.String())
+	}
+
+	headerOnly := RecordStatus(httptest.NewRecorder())
+	headerOnly.WriteHeader(http.StatusAccepted)
+	if got := headerOnly.Outcome(); got != "202" {
+		t.Fatalf("WriteHeader(202) 만 했으면 202: %q", got)
+	}
+
+	via := RecordStatus(httptest.NewRecorder())
+	WriteFail(via, http.StatusUnprocessableEntity, "invalid_request", "")
+	if got := via.Outcome(); got != "422" {
+		t.Fatalf("WriteFail(422) 는 422: %q", got)
+	}
+}

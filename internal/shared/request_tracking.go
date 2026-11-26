@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"time"
 )
 
@@ -124,4 +125,9 @@ func (recorder *StatusRecorder) Status() int {
 		return http.StatusOK
 	}
 	return recorder.status
+}
+
+// Outcome — 잇는 줄의 "-> <상태>" 글자. 뼈대: 지금의 Status() 를 글자로 옮겼을 뿐이다(쓰지 않은 응답의 none 은 구현 조각이 채운다).
+func (recorder *StatusRecorder) Outcome() string {
+	return strconv.Itoa(recorder.Status())
 }
