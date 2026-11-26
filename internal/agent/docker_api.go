@@ -1,8 +1,9 @@
 package agent
 
-// 도커 엔진 API — 유닉스 소켓 위의 HTTP 를 직접 부른다(새 의존성 없음). 자원 지표 수집만 쓴다.
+// 도커 엔진 API — 유닉스 소켓 위의 HTTP 를 직접 부른다(새 의존성 없음). 자원 지표 수집과 통신 수치 수집이 쓴다.
 // 허용된 요청: GET 조회(/containers/json · /containers/{id}/json · /containers/{id}/stats?stream=false&one-shot=true ·
-// /exec/{id}/json) + GPU 값을 읽는 고정 명령 실행 하나(POST /containers/{설정된 이름}/exec · POST /exec/{id}/start).
+// /exec/{id}/json) + GPU 값을 읽는 고정 명령 실행 하나(POST /containers/{설정된 이름}/exec · POST /exec/{id}/start)
+// + 통신 수치 수집의 GET 둘(/containers/{설정된 이름}/json · /containers/{id}/logs — traffic.go).
 // 모든 요청은 부르는 쪽의 ctx(기한)를 그대로 쓴다.
 
 import (

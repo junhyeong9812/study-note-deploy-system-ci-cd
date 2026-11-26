@@ -2,3 +2,4 @@
 .env.master
 .env.agent
 data/
+data-agent/
