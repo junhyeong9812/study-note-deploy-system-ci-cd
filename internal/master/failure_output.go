@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -24,7 +25,11 @@ const (
 	expiredMarkerRetention     = 90 * 24 * time.Hour // 지운 자리의 표지는 지운 때부터 이만큼
 	failureOutputFileLimit     = 4 << 20             // 저장한 파일 하나를 읽는 상한(가린 뒤 256KB 가 JSON 으로 늘어난 것보다 넉넉히)
 	failureOutputDirectoryName = "failure-outputs"   // DEPLOY_OUTPUT_DIR 이 비면 이력 DB 의 폴더 아래 이 이름
+	staleTemporaryAge          = time.Hour           // 쓰다 죽어 남은 임시 파일을 지우는 나이
 )
+
+// temporaryOutputName — writeFileAtomically 가 만드는 임시 파일의 이름 `.<요청 ID>.json.<무엇이든>.tmp`.
+var temporaryOutputName = regexp.MustCompile(`^\.[A-Za-z0-9_-]{1,64}\.json\..+\.tmp$`)
 
 // failureOutput — 저장하는 파일의 꼴이자 조회 응답의 data.
 type failureOutput struct {
@@ -64,13 +69,17 @@ func failureOutputDirectory(databasePath string) string {
 
 // prepareFailureOutputs — 뜰 때 폴더를 만들고 보관 기간을 넘은 것을 정리한다. 못 해도 master 는 뜬다(로그 한 줄 — 남길 때 다시 실패를 드러낸다).
 func (master *Master) prepareFailureOutputs() {
-	if err := os.MkdirAll(master.outputDirectory, 0o700); err != nil {
+	err := os.MkdirAll(master.outputDirectory, 0o700)
+	if err == nil {
+		err = os.Chmod(master.outputDirectory, 0o700) // 이미 있던 폴더도
+	}
+	if err != nil {
 		master.logger.Log("boot", "failure output directory not ready: "+err.Error(), "warning")
 		return
 	}
 	master.outputMutex.Lock()
 	defer master.outputMutex.Unlock()
-	master.cleanFailureOutputs("boot")
+	master.cleanFailureOutputs("boot", "")
 }
 
 // keepFailureOutput — agent 단계의 실패 출력을 가린 뒤 남긴다(agent 가 가렸어도 한 번 더 — agent 를 믿지 않는다).
@@ -102,7 +111,7 @@ func (master *Master) keepFailureOutput(deployment Deployment, stage, detail str
 	if err := writeFileAtomically(master.outputDirectory, deployment.RequestID+".json", record); err != nil {
 		master.logger.Log(deployment.RequestID, "failure output not saved: "+err.Error(), "warning")
 	}
-	master.cleanFailureOutputs(deployment.RequestID)
+	master.cleanFailureOutputs(deployment.RequestID, deployment.RequestID)
 }
 
 // writeFileAtomically — 같은 폴더의 임시 파일(0600)에 쓴 뒤 이름을 바꾼다. 읽는 쪽은 반쯤 쓴 파일을 보지 않는다.
@@ -160,9 +169,11 @@ func readFailureOutput(directory, requestID string) (storedFailureOutput, error)
 	return stored, json.Unmarshal(content, &stored)
 }
 
-// cleanFailureOutputs — 보관(14일 또는 최근 50건)을 넘은 출력을 표지로 바꾸고, 90일이 지난 표지를 지운다.
+// cleanFailureOutputs — 보관(14일 또는 최근 50건)을 넘은 출력을 표지로 바꾸고, 90일이 지난 표지와 1시간 넘은 임시 파일을 지운다.
 // `<요청 ID 꼴>.json` 인 일반 파일 가운데 읽을 수 있는 것만 다룬다. master.outputMutex 를 쥐고 부른다.
-func (master *Master) cleanFailureOutputs(requestID string) {
+// 시계: 방금 남긴 것(justSaved)은 이 정리에서 지우지 않고 50건의 맨 앞에 센다 · 파일의 미래 시각은 지금으로 친다(시계가 뒤로 가도 정리가 멈추지 않는다).
+// requestID 는 로그 줄의 요청 ID 다.
+func (master *Master) cleanFailureOutputs(requestID, justSaved string) {
 	entries, err := os.ReadDir(master.outputDirectory)
 	if err != nil {
 		master.logger.Log(requestID, "failure output cleanup failed: "+err.Error(), "warning")
@@ -176,6 +187,14 @@ func (master *Master) cleanFailureOutputs(requestID string) {
 	}
 	var outputs []keptOutput
 	for _, entry := range entries {
+		if temporaryOutputName.MatchString(entry.Name()) && entry.Type().IsRegular() {
+			if info, err := entry.Info(); err == nil && now.Sub(info.ModTime()) > staleTemporaryAge {
+				if err := os.Remove(filepath.Join(master.outputDirectory, entry.Name())); err != nil {
+					master.logger.Log(requestID, "failure output cleanup failed: "+err.Error(), "warning")
+				}
+			}
+			continue
+		}
 		name, isJSON := strings.CutSuffix(entry.Name(), ".json")
 		if !isJSON || !shared.ValidRequestID(name) || !entry.Type().IsRegular() {
 			continue
@@ -198,14 +217,21 @@ func (master *Master) cleanFailureOutputs(requestID string) {
 		}
 		outputs = append(outputs, keptOutput{name, recordedAt, stored})
 	}
+	// 방금 남긴 것 → 적힌 시각 → 이름, 새것부터. 미래의 시각을 지금으로 쳐도 차례는 같다(같아진 것끼리는 실제 시각이 늦은 쪽이 앞) —
+	// 그래서 적힌 시각 그대로 견준다. 기한도 미래 시각이면 지난 시간이 0 아래라 지나지 않는다.
 	sort.Slice(outputs, func(left, right int) bool {
-		if !outputs[left].recordedAt.Equal(outputs[right].recordedAt) {
-			return outputs[left].recordedAt.After(outputs[right].recordedAt)
+		first, second := outputs[left], outputs[right]
+		if (first.requestID == justSaved) != (second.requestID == justSaved) {
+			return first.requestID == justSaved
 		}
-		return outputs[left].requestID > outputs[right].requestID
+		if !first.recordedAt.Equal(second.recordedAt) {
+			return first.recordedAt.After(second.recordedAt)
+		}
+		return first.requestID > second.requestID
 	})
 	for index, output := range outputs {
-		if index < failureOutputKeptCount && now.Sub(output.recordedAt) <= failureOutputRetention {
+		if output.requestID == justSaved ||
+			(index < failureOutputKeptCount && now.Sub(output.recordedAt) <= failureOutputRetention) {
 			continue
 		}
 		marker := expiredFailureOutput{RequestID: output.requestID, FailedStage: output.stored.FailedStage,
