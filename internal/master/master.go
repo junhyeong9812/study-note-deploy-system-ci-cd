@@ -207,16 +207,22 @@ func (master *Master) advance(deployment Deployment, agentURL string) {
 		delete(master.inFlight, deployment.Service)
 		master.mutex.Unlock()
 	}()
+	// fail — 모든 detail 의 원천(agent 단계 · agent_rejected · unexpected_response · agent_unreachable · store_failed)이 지나는 곳.
+	// 여기서 한 번 가려(agent 가 가렸어도 — 옛 agent 는 가리지 않는다) 이력 · 알림의 몸 · 로그의 끝을 그 가린 글에서 뗀다.
 	fail := func(stage, detail string) {
+		historyTail, alertTail, logTail := shared.DetailRedactionFailed, shared.DetailRedactionFailed, shared.DetailRedactionFailed
+		if masked, redacted := shared.RedactSafely(master.redact, detail); redacted {
+			historyTail, alertTail, logTail = shared.CutTail(masked.Text, detailLimit), shared.CutTail(masked.Text, 800), shared.CutTail(masked.Text, 200)
+		}
 		deployment.State, deployment.FailedStage = StateFailed, stage
-		deployment.Detail, deployment.FinishedAt = lastPart(detail, detailLimit), now()
+		deployment.Detail, deployment.FinishedAt = historyTail, now()
 		master.logger.Log(deployment.RequestID, fmt.Sprintf("deploy failed %s sha=%s stage=%s %s",
-			deployment.Service, deployment.CommitSha, stage, lastPart(detail, 200)), "error")
+			deployment.Service, deployment.CommitSha, stage, logTail), "error")
 		master.recordFinished(deployment)
 		// 사람이 알아야 한다 — GitHub 메일에만 기대지 않는다. 보내기에 실패해도 배포 결과는 그대로다.
 		master.alerts.Send(deployment.RequestID, "deploy_failed", "warning", "deploy-failed:"+deployment.Service+":"+deployment.CommitSha,
 			fmt.Sprintf("배포 실패 %s — 단계 %s", deployment.Service, stage),
-			fmt.Sprintf("커밋 %s\n%s", deployment.CommitSha, lastPart(detail, 800)))
+			fmt.Sprintf("커밋 %s\n%s", deployment.CommitSha, alertTail))
 	}
 	enter := func(state string) bool {
 		deployment.State = state
@@ -420,12 +426,4 @@ func keys(input map[string]string) []string {
 		result = append(result, key)
 	}
 	return result
-}
-
-// lastPart — 출력의 끝부분. 빌드·테스트 오류는 끝에 있다.
-func lastPart(input string, limit int) string {
-	if len(input) <= limit {
-		return input
-	}
-	return input[len(input)-limit:]
 }

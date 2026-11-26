@@ -18,7 +18,7 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 
 ## 상태와 API
 
-- 상태: `accepted → ci_running → cd_running → succeeded | failed`. `failed` 에는 `failed_stage` 와 출력 끝부분이 붙는다.
+- 상태: `accepted → ci_running → cd_running → succeeded | failed`. `failed` 에는 `failed_stage` 와 출력 끝부분(가린 뒤에 뗀 것 — 아래 "끝부분도 가린다")이 붙는다.
 - 실패 단계: `ci_fetch` · `ci_test` · `ci_build` · `cd_up` · `cd_health` · `agent_unreachable` · `agent_rejected`(agent 가 단계 전에 거절 — 설정 누락·계속 작업 중. 사유는 `detail`) · `store_failed`(이력 기록 실패) · `interrupted`(master 재시작)
 - 시간 예산: agent 작업 중 대기 3분 + CI 11.5분 + CD 5분 — 워크플로 조회 상한 20분 안
 
@@ -45,7 +45,8 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 
 이력의 `detail` 은 출력의 끝 2000바이트뿐이다. agent 단계(`ci_fetch` · `ci_test` · `ci_build` · `cd_up` · `cd_health` · `cd_switch`)가 실패하면 그 단계의 출력 전체를 가리고 줄여 master 가 이력 옆에 남긴다.
 
-- **흐름**: master 는 `/agent/ci` · `/agent/cd` 를 부를 때마다 머리 `X-Deploy-Failure-Output: v1` 을 싣는다. agent 는 이 머리의 값이 정확히 `v1` 일 때만 단계 실패 봉투의 `error` 에 `output: {text, truncated, omitted_bytes, redactions}` 를 더한다(보내기 전에 가리고 줄인다). `detail`(가리지 않은 끝 2000바이트)은 그대로다. master 는 `output.text` 를, 없으면(옛 agent) `detail` 을 **한 번 더** 가리고 줄여(agent 를 믿지 않는다) 실패가 조회에 보이기 전에 파일로 남긴다. agent 응답은 4MB 까지 읽는다(가린 뒤 256KB 의 글이 JSON 으로 이스케이프되면 몇 배로 는다). 봉투가 아닌 응답(`unexpected_response`)의 `detail` 에는 처음 16KB 만 싣는다.
+- **흐름**: master 는 `/agent/ci` · `/agent/cd` 를 부를 때마다 머리 `X-Deploy-Failure-Output: v1` 을 싣는다. agent 는 이 머리의 값이 정확히 `v1` 일 때만 단계 실패 봉투의 `error` 에 `output: {text, truncated, omitted_bytes, redactions}` 를 더한다(보내기 전에 가리고 줄인다). `detail` 은 같은 가린 글의 끝 2000바이트다(아래 "끝부분도 가린다"). master 는 `output.text` 를, 없으면(옛 agent) `detail` 을 **한 번 더** 가리고 줄여(agent 를 믿지 않는다) 실패가 조회에 보이기 전에 파일로 남긴다. agent 응답은 4MB 까지 읽는다(가린 뒤 256KB 의 글이 JSON 으로 이스케이프되면 몇 배로 는다). 봉투가 아닌 응답(`unexpected_response`)의 `detail` 에는 처음 16KB 만 싣는다.
+- **끝부분도 가린다**: 이력의 `detail`(끝 2000바이트) · 알림의 몸(끝 800 — 앞의 `커밋 <sha>` 줄은 그대로) · 로그의 끝부분(200)은 **가린 뒤에** 뗀다(위 "가림"과 같은 규칙 — 새 규칙이 아니다). agent 는 실패 글 전체를 한 번 가리고 그 글에서 봉투의 `detail` · 로그의 끝 · 청한 경우의 `output` 을 모두 뗀다(머리를 청하지 않아도 가린다 — 봉투의 칸은 그대로). master 는 모든 `detail` 의 원천(agent 단계 실패 · `agent_rejected` · `unexpected_response` · `agent_unreachable` · `store_failed`)을 이력 · 알림 · 로그에 쓰기 전에 한 번 더 가린다(agent 를 믿지 않는다). 끝을 떼는 자리가 가림 표시의 가운데면 그 표시를 통째로 버리고, 글자의 가운데면 다음 글자에서 시작한다(옛 바이트 자르기는 깨진 UTF-8 을 남길 수 있었다). 길이 · 칸 · 알림의 key · 제목 · 등급은 그대로이고, 가릴 것이 없는 글은 바이트까지 그대로다(제어열 · `\r` · NUL 이 든 글은 정리된 꼴로 실린다). 큰 실패 글도 전체를 가린 뒤에 뗀다(끝만 가리면 경계에 걸친 비밀값이 반쪽으로 남는다). 가림이 깨지면(패닉) 끝부분 대신 `[가림 실패 — 끝부분을 싣지 않았다]` 를 싣고 `output` 을 싣지 않으며 master 는 실패 출력을 남기지 않는다 — 배포의 결과 · 단계 · 이력 · 알림은 그대로 가고 master 는 계속 돈다.
 - **남기지 않는 것**: 성공한 배포 · master 단계의 실패(`agent_unreachable` · `agent_rejected` · `store_failed` · `interrupted`).
 - **자리**: `DEPLOY_OUTPUT_DIR`(비면 `DEPLOY_DB_PATH` 의 폴더 아래 `failure-outputs` — compose 에서는 `/data/failure-outputs`, 이력 DB 와 같은 볼륨이라 컨테이너를 다시 만들어도 남는다). master 가 뜰 때 0700 으로 만든다 — 만들지 못해도 뜬다(로그 한 줄). 요청 ID 하나에 `<요청 ID>.json` 하나(0600 — 같은 폴더의 임시 파일에 쓴 뒤 이름 바꾸기).
 - **남기지 못해도**(디스크가 찼을 때 등) 배포의 결과 · 이력 · 알림은 그대로다. 로그에 `failure output not saved: <오류>` 한 줄(요청 ID 와 함께 — 출력의 내용은 싣지 않는다).
@@ -83,8 +84,8 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 | 남긴 것이 없음(master 단계의 실패 · 남기기 실패 · 이 기능 전의 실패 · 표지의 90일이 지남) | 404 | `output_not_recorded` |
 | 출력 파일을 읽지 못함(심볼릭 링크 — 따라가지 않는다 · 폴더를 쓸 수 없음 · 깨진 파일) | 500 | `output_read_failed` |
 
-- **섞인 판**: 옛 master ↔ 새 agent 는 머리를 싣지 않으므로 지금 봉투 그대로다(옛 master 의 16KB 읽기에 걸리지 않는다). 새 master ↔ 옛 agent 는 `detail`(끝 2000바이트)을 가려 남긴다. 배포 순서에 기대지 않는다.
-- **알려진 한계**: agent 의 명령 실행은 지금처럼 출력 전체를 메모리에 올린 뒤 가린다. 이력의 `detail`(끝 2000) · 알림의 몸(끝 800) · 로그의 끝부분(200)은 **가리지 않은 채** 나간다(이 조각의 범위 밖 — 따로 정한다). 첫 묶음을 줄여 적은 IPv6(`fd0::1` 꼴)는 잡지 않는다. 끝 표시 없는 PEM 은 64KB, 끝 표시 없는 OSC 제어열은 줄바꿈이나 4KB 에서 그친 것으로 본다. 잡지 않는 꼴: 줄을 넘는 YAML 값 · k8s 의 `name:` / `value:` 짝 · URL 인코딩된 `password%3D` · URL 의 비밀번호에 인코딩 안 된 `/` · `\r` 로 나뉜 값 · `PGPASS` 처럼 한 마디로 붙은 이름 · 낱말 안에 낀 제어 문자(`pass\x00word=`). 지나치게 가리는 꼴: 64자 컨테이너 ID(16진) · `test_pass: yes` · `@v1.2.3-rc.beta`(메일 꼴). 1MB 를 넘는 한 줄은 내용을 남기지 않는다. 시계가 크게 앞으로 튄 채 남기면 그 앞의 것들이 기한(14일)으로 지워진다 — 시계를 되돌려도 되살릴 수 없다.
+- **섞인 판**: 옛 master ↔ 새 agent 는 머리를 싣지 않으므로 지금 봉투 그대로다(옛 master 의 16KB 읽기에 걸리지 않는다). 새 master ↔ 옛 agent 는 `detail`(끝 2000바이트)을 가려 남기고, 이력 · 알림 · 로그에도 master 가 가린 끝을 쓴다. 새 agent ↔ 옛 master 에게는 이미 가려진 `detail` 이 간다(옛 master 는 그것을 그대로 싣는다). 배포 순서에 기대지 않는다.
+- **알려진 한계**: agent 의 명령 실행은 지금처럼 출력 전체를 메모리에 올린 뒤 가린다. 가리지 않은 채 나가는 끝부분이 남아 있다: agent 의 이미지 정리 · 자리 정지 로그의 끝(200), 두 자리가 남았을 수 있다는 `slots_left` 알림, 성공 봉투의 `data.output`(끝 2000), master 의 이력 DB 오류 로그(이 조각의 범위 밖). 첫 묶음을 줄여 적은 IPv6(`fd0::1` 꼴)는 잡지 않는다. 끝 표시 없는 PEM 은 64KB, 끝 표시 없는 OSC 제어열은 줄바꿈이나 4KB 에서 그친 것으로 본다. 잡지 않는 꼴: 줄을 넘는 YAML 값 · k8s 의 `name:` / `value:` 짝 · URL 인코딩된 `password%3D` · URL 의 비밀번호에 인코딩 안 된 `/` · `\r` 로 나뉜 값 · `PGPASS` 처럼 한 마디로 붙은 이름 · 낱말 안에 낀 제어 문자(`pass\x00word=`). 지나치게 가리는 꼴: 64자 컨테이너 ID(16진) · `test_pass: yes` · `@v1.2.3-rc.beta`(메일 꼴). 1MB 를 넘는 한 줄은 내용을 남기지 않는다. 시계가 크게 앞으로 튄 채 남기면 그 앞의 것들이 기한(14일)으로 지워진다 — 시계를 되돌려도 되살릴 수 없다.
 
 ## git 조회 — 읽기만 (배포 상세의 커밋·diff)
 

@@ -150,13 +150,19 @@ func (agent *Agent) handleStage(name string, execute func(service, commitSha str
 			if errors.As(err, &staged) {
 				stage, detail = staged.stage, staged.output
 			}
-			agent.logger.Log(requestID, fmt.Sprintf("agent %s failed %s stage=%s %dms: %s", name, payload.Service, stage, tookMs, tail(detail, 200)), "error")
-			// 청한 master 에게만 실패 글 전체를 가리고 줄여 싣는다 — 옛 master(16KB 까지 읽음)에게는 지금 봉투 그대로
-			if request.Header.Get(shared.FailureOutputHeader) == shared.FailureOutputVersion {
-				shared.WriteFailWithOutput(writer, http.StatusInternalServerError, stage, tail(detail, outputTailLimit), shared.CaptureOutput(detail))
+			// 실패 글은 한 번 가리고, detail · 로그의 끝 · 청한 경우의 output 은 모두 그 가린 글에서 뗀다(청하지 않아도 가린다)
+			masked, redacted := shared.RedactSafely(agent.redact, detail)
+			detailTail, logTail := shared.DetailRedactionFailed, shared.DetailRedactionFailed
+			if redacted {
+				detailTail, logTail = shared.CutTail(masked.Text, outputTailLimit), shared.CutTail(masked.Text, 200)
+			}
+			agent.logger.Log(requestID, fmt.Sprintf("agent %s failed %s stage=%s %dms: %s", name, payload.Service, stage, tookMs, logTail), "error")
+			// 청한 master 에게만 output 을 싣는다 — 옛 master(16KB 까지 읽음)에게는 칸이 지금과 같은 봉투
+			if redacted && request.Header.Get(shared.FailureOutputHeader) == shared.FailureOutputVersion {
+				shared.WriteFailWithOutput(writer, http.StatusInternalServerError, stage, detailTail, masked)
 				return
 			}
-			shared.WriteFail(writer, http.StatusInternalServerError, stage, tail(detail, outputTailLimit))
+			shared.WriteFail(writer, http.StatusInternalServerError, stage, detailTail)
 			return
 		}
 		agent.logger.Log(requestID, fmt.Sprintf("agent %s ok %s sha=%s %dms", name, payload.Service, payload.CommitSha, tookMs), "info")

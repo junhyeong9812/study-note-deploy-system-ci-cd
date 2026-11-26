@@ -100,7 +100,11 @@ func (master *Master) keepFailureOutput(deployment Deployment, stage, detail str
 	if agentOutput != nil && agentOutput.Text != "" {
 		source = agentOutput.Text
 	}
-	captured := shared.CaptureOutput(source)
+	captured, redacted := shared.RedactSafely(master.redact, source)
+	if !redacted { // 가리지 못한 글은 남기지 않는다
+		master.logger.Log(deployment.RequestID, "failure output not saved: redaction failed", "warning")
+		return
+	}
 	if agentOutput != nil && agentOutput.Text != "" { // agent 가 이미 줄이고 가린 몫을 더한다
 		captured.Truncated = captured.Truncated || agentOutput.Truncated
 		captured.OmittedBytes += max(agentOutput.OmittedBytes, 0)
