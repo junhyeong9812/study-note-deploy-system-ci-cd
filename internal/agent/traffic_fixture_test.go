@@ -27,6 +27,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/junhyeong9812/study-note-deploy-system-ci-cd/internal/shared"
@@ -749,7 +750,7 @@ func requireObserveAccepts(t *testing.T, item trafficItem) {
 	billion := big.NewInt(1_000_000_000)
 	text := func(value any, limit int) string {
 		textValue, ok := value.(string)
-		if !ok || len([]rune(textValue)) > limit {
+		if !ok || len(utf16.Encode([]rune(textValue))) > limit { // Kotlin String.length = UTF-16 단위(TrafficEntry.kt:313)
 			fail("글자가 아니거나 길다: %v", value)
 		}
 		for _, character := range textValue {

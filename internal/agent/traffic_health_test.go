@@ -5,6 +5,7 @@ package agent
 // 정한 계약:
 //   - GET /health 의 data = {"mode":"agent","traffic":{…}}(AgentHealth). traffic 의 칸(차례 그대로): enabled · disabled_reason · generation ·
 //     last_seq · last_sent_at(XADD 에 성공한 때의 벽시계 epoch ms) · pending(written 이 남음) · send_failures(이어지는 보내기 실패) ·
+//     cursor_write_failures(이어지는 읽은 자리 파일의 쓰기 실패 — 리뷰 루프 1 R1) ·
 //     skipped_cycles · requests_filtered · time_reversals · clock_behind · oversized_entries · panics ·
 //     containers[{name · state(ok · replaced · rotated · unreadable · cursor_lost · clock_behind — 아직 읽지 않았으면 null) · lines · unparsed · ignored(누적)}](이름 순).
 //   - 접속 기록의 내용(경로 · 요청 ID)은 헬스 · 로그 어디에도 없다.
@@ -57,7 +58,7 @@ func TestHealthReportsTrafficState(t *testing.T) {
 	}
 	json.Unmarshal(encoded, &data)
 	requireExactKeyOrder(t, "traffic", string(data.Traffic), []string{"enabled", "disabled_reason", "generation", "last_seq", "last_sent_at", "pending",
-		"send_failures", "skipped_cycles", "requests_filtered", "time_reversals", "clock_behind", "oversized_entries", "panics", "containers"})
+		"send_failures", "cursor_write_failures", "skipped_cycles", "requests_filtered", "time_reversals", "clock_behind", "oversized_entries", "panics", "containers"})
 	if !strings.HasPrefix(string(encoded), `{"mode":"agent","traffic":{`) {
 		t.Fatalf("mode 는 그대로: %s", encoded)
 	}
