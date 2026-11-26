@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,7 +35,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/junhyeong9812/study-note-deploy-system-ci-cd/internal/shared"
 )
@@ -164,20 +164,21 @@ type TrafficContainerHealth struct {
 
 // TrafficHealth — 에이전트의 /health 의 traffic 객체.
 type TrafficHealth struct {
-	Enabled          bool                     `json:"enabled"`
-	DisabledReason   *string                  `json:"disabled_reason"`
-	Generation       *string                  `json:"generation"`
-	LastSeq          *int64                   `json:"last_seq"`
-	LastSentAt       *int64                   `json:"last_sent_at"`
-	Pending          bool                     `json:"pending"`
-	SendFailures     int64                    `json:"send_failures"`
-	SkippedCycles    int64                    `json:"skipped_cycles"`
-	RequestsFiltered int64                    `json:"requests_filtered"`
-	TimeReversals    int64                    `json:"time_reversals"`
-	ClockBehind      int64                    `json:"clock_behind"`
-	OversizedEntries int64                    `json:"oversized_entries"`
-	Panics           int64                    `json:"panics"`
-	Containers       []TrafficContainerHealth `json:"containers"`
+	Enabled             bool                     `json:"enabled"`
+	DisabledReason      *string                  `json:"disabled_reason"`
+	Generation          *string                  `json:"generation"`
+	LastSeq             *int64                   `json:"last_seq"`
+	LastSentAt          *int64                   `json:"last_sent_at"`
+	Pending             bool                     `json:"pending"`
+	SendFailures        int64                    `json:"send_failures"`
+	CursorWriteFailures int64                    `json:"cursor_write_failures"` // 이어지는 읽은 자리 파일의 쓰기 실패 — 0 이 아니면 수집이 나아가지 못한다(볼륨의 권한 · 디스크)
+	SkippedCycles       int64                    `json:"skipped_cycles"`
+	RequestsFiltered    int64                    `json:"requests_filtered"`
+	TimeReversals       int64                    `json:"time_reversals"`
+	ClockBehind         int64                    `json:"clock_behind"`
+	OversizedEntries    int64                    `json:"oversized_entries"`
+	Panics              int64                    `json:"panics"`
+	Containers          []TrafficContainerHealth `json:"containers"`
 }
 
 // TrafficCollector — 아래 칸은 테스트가 바꾸는 이음매다(newTrafficCollector 가 운영 값으로 채운다).
@@ -200,7 +201,6 @@ type TrafficCollector struct {
 	incomplete     map[string]logPosition         // 줄바꿈 없이 끝난 마지막 묶음을 한 번 기다린 자리 — 단순화: 메모리에만 둔다, 다시 시작하면 한 주기를 더 기다린다(줄을 잃지 않는다)
 	pendingDeltas  map[string]trafficSourceCounts // written 항목의 수 — 보내기에 성공하면 헬스에 더한다(단순화: 다시 시작한 뒤 다시 보낸 항목의 수는 헬스에 더하지 않는다 — 헬스는 이 실행의 누적)
 	pendingFilter  int64                          // written 항목의 requests_filtered
-	cursorFailing  bool                           // 읽은 자리 파일을 쓰지 못하는 중(첫 번에만 로그)
 
 	mutex         sync.Mutex
 	health        TrafficHealth
@@ -610,21 +610,28 @@ func (collector *TrafficCollector) encodeCursor() ([]byte, error) {
 	return json.Marshal(document)
 }
 
-// saveCursor — 메모리의 자리를 파일에 적는다. 쓰지 못하면 첫 번에만 로그(경로는 설정 값 — 접속 기록의 내용이 아니다).
+// saveCursor — 메모리의 자리를 파일에 적는다. 이어지는 실패를 헬스의 cursor_write_failures 에 세고(성공하면 0),
+// 로그는 첫 실패와 회복에만(오류의 글에 든 경로는 설정 값 — 접속 기록의 내용이 아니다).
 func (collector *TrafficCollector) saveCursor() error {
 	content, err := collector.encodeCursor()
 	if err == nil {
 		err = collector.writeCursor(collector.settings.CursorPath, content)
 	}
+	collector.mutex.Lock()
+	failures := collector.health.CursorWriteFailures
 	if err != nil {
-		if !collector.cursorFailing {
-			collector.logf("traffic cursor write failed: "+err.Error(), "warning")
-		}
-		collector.cursorFailing = true
-		return err
+		collector.health.CursorWriteFailures++
+	} else {
+		collector.health.CursorWriteFailures = 0
 	}
-	collector.cursorFailing = false
-	return nil
+	collector.mutex.Unlock()
+	switch {
+	case err != nil && failures == 0:
+		collector.logf("traffic cursor write failed: "+err.Error(), "warning")
+	case err == nil && failures > 0:
+		collector.logf(fmt.Sprintf("traffic cursor write recovered after %d failures", failures), "info")
+	}
+	return err
 }
 
 // publishCursorHealth — 헬스의 세대 · 대기 여부를 메모리의 자리에 맞춘다.
@@ -673,6 +680,7 @@ func (collector *TrafficCollector) sendLast(parent context.Context) bool {
 	if recovered > 0 {
 		collector.logf(fmt.Sprintf("traffic stream recovered after %d failed sends", recovered), "info")
 	}
+	before := append([]trafficCursorContainerState(nil), collector.cursor.containers...)
 	for _, source := range last.sources {
 		for index := range collector.cursor.containers {
 			if container := &collector.cursor.containers[index]; container.name == source.container {
@@ -681,8 +689,12 @@ func (collector *TrafficCollector) sendLast(parent context.Context) bool {
 		}
 	}
 	last.state = trafficCursorSent
-	// sent 를 적지 못해도(죽음) 다시 시작한 수집기가 같은 순번을 같은 바이트로 다시 보낸다 — 관측 서버가 뒤의 것을 버린다
-	collector.saveCursor()
+	if collector.saveCursor() != nil {
+		// sent 를 적지 못했다 — 파일은 written 그대로다. 메모리도 되돌려 다음 주기가 같은 순번을 같은 바이트로 다시 보낸다(관측 서버가 뒤의 것을 버린다)
+		collector.cursor.containers, last.state = before, trafficCursorWritten
+		collector.publishCursorHealth()
+		return false
+	}
 	collector.publishCursorHealth()
 	return true
 }
@@ -1205,7 +1217,7 @@ func parseTrafficAccessLine(content []byte) (*trafficAccessRecord, bool) {
 	}
 	record.endMilliseconds = endMilliseconds
 	if !trafficRequestIDPattern.MatchString(record.requestID) || !trafficRecordedCallers[record.caller] || !trafficServiceNames[record.service] ||
-		!trafficMethodPattern.MatchString(record.method) || utf8.RuneCountInString(record.path) > trafficPathLimit || hasControlCharacter(record.path) {
+		!trafficMethodPattern.MatchString(record.method) || utf16Length(record.path) > trafficPathLimit || hasControlCharacter(record.path) {
 		return nil, false
 	}
 	switch string(raw["path_truncated"]) {
@@ -1230,7 +1242,7 @@ func parseTrafficAccessLine(content []byte) (*trafficAccessRecord, bool) {
 	}
 	upstreamTime, upstreamStatus, slot := text["upstream_time"], text["upstream_status"], text["slot"]
 	if (upstreamTime != "" && !trafficUpstreamTime.MatchString(upstreamTime)) || (upstreamStatus != "" && !trafficUpstreamStatus.MatchString(upstreamStatus)) ||
-		utf8.RuneCountInString(upstreamStatus) > trafficTextLimit || !trafficSlots[slot] {
+		utf16Length(upstreamStatus) > trafficTextLimit || !trafficSlots[slot] {
 		return nil, false
 	}
 	bytesSent, err := strconv.ParseInt(string(raw["bytes_sent"]), 10, 64)
@@ -1238,7 +1250,9 @@ func parseTrafficAccessLine(content []byte) (*trafficAccessRecord, bool) {
 		return nil, false
 	}
 	record.bytesSent = bytesSent
-	record.upstreamMilliseconds = sumUpstreamMilliseconds(upstreamTime)
+	if record.upstreamMilliseconds, ok = sumUpstreamMilliseconds(upstreamTime); !ok {
+		return nil, false // 조각 하나가 int64 밖이거나 합이 넘친다 — 음수 · 0 으로 바꿔 싣지 않는다
+	}
 	if upstreamStatus != "" && upstreamStatus != "-" {
 		record.upstreamStatus = &upstreamStatus
 	}
@@ -1259,7 +1273,8 @@ func hasControlCharacter(text string) bool {
 }
 
 // sumUpstreamMilliseconds — `,` · `:` 로 나눈 조각의 합(`-` · "" 조각은 건너뛴다). 더할 조각이 없으면 nil.
-func sumUpstreamMilliseconds(upstreamTime string) *int64 {
+// 조각의 ms 가 int64 를 넘거나 합이 넘치면 ok=false(그 줄은 unparsed).
+func sumUpstreamMilliseconds(upstreamTime string) (*int64, bool) {
 	var total int64
 	found := false
 	for _, piece := range strings.FieldsFunc(upstreamTime, func(character rune) bool { return character == ',' || character == ':' }) {
@@ -1267,15 +1282,29 @@ func sumUpstreamMilliseconds(upstreamTime string) *int64 {
 		if piece == "" || piece == "-" {
 			continue
 		}
-		if milliseconds, ok := threeDecimalMilliseconds(piece); ok {
-			total += milliseconds
-			found = true
+		milliseconds, ok := threeDecimalMilliseconds(piece)
+		if !ok || milliseconds > math.MaxInt64-total {
+			return nil, false
 		}
+		total += milliseconds
+		found = true
 	}
 	if !found {
-		return nil
+		return nil, true
 	}
-	return &total
+	return &total, true
+}
+
+// utf16Length — 관측 서버(Kotlin String.length)와 같은 단위의 길이: U+10000 이상의 글자는 2.
+func utf16Length(text string) int {
+	length := 0
+	for _, character := range text {
+		length++
+		if character >= 0x10000 {
+			length++
+		}
+	}
+	return length
 }
 
 // classifyTrafficRequest — 규약 §3.6 의 갈래: health → stream → request(표에 없는 서비스는 request).
