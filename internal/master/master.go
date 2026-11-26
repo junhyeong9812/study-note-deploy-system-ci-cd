@@ -125,7 +125,7 @@ func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Req
 	recorder, job := shared.RecordStatus(writer), "invalid"
 	writer = recorder
 	defer func() {
-		master.logger.Log(shared.TrackingID(request.Context()), fmt.Sprintf("deploy accept job=%s -> %d", job, recorder.Status()), "info")
+		master.logger.Log(shared.TrackingID(request.Context()), fmt.Sprintf("deploy accept job=%s -> %s", job, recorder.Outcome()), "info")
 	}()
 	if !shared.SecretMatches(request, master.secret) {
 		shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")
@@ -388,8 +388,10 @@ func (master *Master) callAgent(url string, deployment Deployment, timeout time.
 func (master *Master) handleDeployment(writer http.ResponseWriter, request *http.Request) {
 	recorder, job := shared.RecordStatus(writer), shared.JobForLog(request.PathValue("requestID"))
 	writer = recorder
-	defer func() {
-		master.logger.Log(shared.TrackingID(request.Context()), fmt.Sprintf("deploy status job=%s -> %d", job, recorder.Status()), "info")
+	defer func() { // 실패했을 때만 — 워크플로가 10초마다 조회하므로 성공한 조회마다 남기면 배포 하나에 수십 줄이 된다
+		if !recorder.Succeeded() {
+			master.logger.Log(shared.TrackingID(request.Context()), fmt.Sprintf("deploy status job=%s -> %s", job, recorder.Outcome()), "info")
+		}
 	}()
 	if !shared.SecretMatches(request, master.secret) {
 		shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")

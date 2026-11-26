@@ -48,12 +48,12 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 - **받는 쪽의 판정**: 마스터 · 에이전트는 nginx 없이 요청을 처음 받는 쪽이라 앱이 직접 정한다. `X-Request-Id` 가 **정확히 하나**이고 꼴이 `^[A-Za-z0-9_-]{1,64}$` 이며 **연결의 상대 주소(`RemoteAddr`)가 사설 대역 · 루프백**일 때만 그 값을 받는다. 아니면 16진수 소문자 32자를 새로 만든다. 대역은 nginx 의 `geo $from_private` 와 같다: `127.0.0.0/8` · `10.0.0.0/8` · `172.16.0.0/12` · `192.168.0.0/16` · `::1` · `fc00::/7` · `fe80::/10`(IPv4 를 담은 `::ffff:a.b.c.d` 는 IPv4 로 본다 · 영역 `%eth0` 은 뗀다 · `169.254/16` · `100.64/10` 은 밖). `X-Forwarded-For` · `X-Real-IP` · `Forwarded` 는 보지 않는다(바깥이 사설 대역인 체할 수 없게).
 - **모든 응답에 돌려준다**: 성공 · 4xx · 5xx · 경로 없음(404) · 메서드 틀림(405)까지 응답 머리글 `X-Request-Id` 에 그 요청의 추적 ID 를 싣는다(mux 전체에 씌운 감싸개가 핸들러 전에 쓴다). 응답의 상태 · 본문 · 다른 머리글은 그대로다. 핸들러의 panic 은 지금처럼 net/http 까지 올라간다.
 - **배포 하나의 로그는 일의 ID 로 찾는다**: 접수 · 진행 · 실패 출력 · 에이전트의 배포 줄(`deploy accepted` · `deploy failed` · `deploy succeeded` · `agent ci start` …)은 지금처럼 **일의 ID** 로 남는다(어드민의 사건 분석이 그 ID 로 로그를 찾는다). 접수는 202 로 끝난 요청이라 그 추적 ID 를 뒤의 진행까지 끌고 가지 않는다 — 두 ID 를 잇는 줄(`job=`)만 추적의 ID 로 남긴다.
-- **잇는 줄**(`info` · `<추적 ID>:<서버>:<내용>` — `job=` 에는 꼴이 맞는 일의 ID 만, 아니면 `invalid`: 본문 · 경로의 날 값을 싣지 않는다):
+- **잇는 줄**(`info` · `<추적 ID>:<서버>:<내용>` — `job=` 에는 꼴이 맞는 일의 ID 만, 아니면 `invalid`: 본문 · 경로의 날 값을 싣지 않는다. `-> <상태>` 는 응답의 첫 상태이고, 핸들러가 응답을 쓰기 전에 끝났으면(panic 등) `-> none`):
 
   | 어디서 | 글자 |
   |---|---|
   | 마스터 `POST /deploy` | `deploy accept job=<일의 ID 또는 invalid> -> <상태>`(일의 ID 를 정하기 전에 끝난 요청 — 인증 실패 · 본문을 해석하지 못함 — 은 `invalid`. 본문에 `request_id` 가 없거나 꼴이 틀리면 마스터가 만든 `req-…`) |
-  | 마스터 `GET /deploys/{id}` · `GET /deploys/{id}/output` | `deploy status job=<경로의 id 또는 invalid> -> <상태>` · `deploy output job=… -> <상태>` |
+  | 마스터 `GET /deploys/{id}` · `GET /deploys/{id}/output` | **실패했을 때만**(2xx 가 아닌 응답 · `none`) `deploy status job=<경로의 id 또는 invalid> -> <상태>` · `deploy output job=… -> <상태>` — 워크플로가 10초마다 조회하므로 성공한 조회에는 줄을 남기지 않는다(응답 머리글은 늘 싣는다) |
   | 마스터 → 에이전트(배포의 진행 — 호출마다) | `deploy <ci 또는 cd> call job=<일의 ID> -> <상태 또는 unreachable>` — 새 추적 ID 로 |
   | 에이전트 `POST /agent/ci` · `/agent/cd` | `agent <ci 또는 cd> job=<일의 ID 또는 invalid> -> <상태>` |
 

@@ -111,7 +111,7 @@ func (agent *Agent) handleStage(name string, execute func(service, commitSha str
 		recorder, job := shared.RecordStatus(writer), "invalid"
 		writer = recorder
 		defer func() {
-			agent.logger.Log(shared.TrackingID(request.Context()), fmt.Sprintf("agent %s job=%s -> %d", name, job, recorder.Status()), "info")
+			agent.logger.Log(shared.TrackingID(request.Context()), fmt.Sprintf("agent %s job=%s -> %s", name, job, recorder.Outcome()), "info")
 		}()
 		if !shared.SecretMatches(request, agent.secret) {
 			shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")

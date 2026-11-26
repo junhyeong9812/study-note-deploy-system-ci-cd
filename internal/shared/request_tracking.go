@@ -93,7 +93,7 @@ func JobForLog(job string) string {
 	return "invalid"
 }
 
-// StatusRecorder — 핸들러가 낸 상태를 기억한다(잇는 줄 "-> <상태>"). 아무것도 쓰지 않으면 200.
+// StatusRecorder — 핸들러가 낸 상태를 기억한다(잇는 줄 "-> <상태>").
 type StatusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -120,14 +120,15 @@ func (recorder *StatusRecorder) Write(content []byte) (int, error) {
 // Unwrap — http.ResponseController 가 안의 writer 를 찾게 한다.
 func (recorder *StatusRecorder) Unwrap() http.ResponseWriter { return recorder.ResponseWriter }
 
-func (recorder *StatusRecorder) Status() int {
+// Outcome — 잇는 줄의 "-> <상태>" 글자: 아무것도 쓰지 않았으면 none(핸들러가 응답 전에 panic 한 경우 등), Write 만 했으면 200, 그 밖은 첫 상태.
+func (recorder *StatusRecorder) Outcome() string {
 	if recorder.status == 0 {
-		return http.StatusOK
+		return "none"
 	}
-	return recorder.status
+	return strconv.Itoa(recorder.status)
 }
 
-// Outcome — 잇는 줄의 "-> <상태>" 글자. 뼈대: 지금의 Status() 를 글자로 옮겼을 뿐이다(쓰지 않은 응답의 none 은 구현 조각이 채운다).
-func (recorder *StatusRecorder) Outcome() string {
-	return strconv.Itoa(recorder.Status())
+// Succeeded — 응답이 2xx 였다(쓰지 않고 끝났으면 아니다).
+func (recorder *StatusRecorder) Succeeded() bool {
+	return recorder.status >= 200 && recorder.status <= 299
 }

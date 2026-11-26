@@ -260,8 +260,10 @@ func (master *Master) cleanFailureOutputs(requestID string) {
 func (master *Master) handleFailureOutput(writer http.ResponseWriter, request *http.Request) {
 	recorder, job := shared.RecordStatus(writer), shared.JobForLog(request.PathValue("requestID"))
 	writer = recorder
-	defer func() {
-		master.logger.Log(shared.TrackingID(request.Context()), fmt.Sprintf("deploy output job=%s -> %d", job, recorder.Status()), "info")
+	defer func() { // 실패했을 때만(상태 조회와 같다)
+		if !recorder.Succeeded() {
+			master.logger.Log(shared.TrackingID(request.Context()), fmt.Sprintf("deploy output job=%s -> %s", job, recorder.Outcome()), "info")
+		}
 	}()
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.Header().Set("X-Content-Type-Options", "nosniff")
