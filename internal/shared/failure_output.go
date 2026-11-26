@@ -25,14 +25,11 @@ const (
 )
 
 const (
-	linePieceLimit     = 64 << 10 // 줄바꿈 없이 이보다 길면 나눠 가린다
-	linePieceSpaceSpan = 4 << 10  // 나누는 자리를 찾는 조각 끝의 폭(마지막 공백 · 탭 뒤)
-	pieceLookBehind    = 8 << 10  // 나누는 자리에 걸친 맞음을 찾는 폭 — 자리 앞
-	pieceLookAhead     = 4 << 10  // 〃 — 자리 뒤(이만큼 더 받은 뒤에 나눈다)
-	redactBlockLimit   = 64 << 10 // 줄을 이만큼 모아 한 번에 거른다
-	pemSwallowLimit    = 64 << 10 // END 없는 PEM 을 삼키는 상한
-	oscLengthLimit     = 4 << 10  // 끝 표시 없는 OSC 를 삼키는 상한
-	maskPrefix         = "[가림:"
+	longLineLimit    = 1 << 20  // 한 줄(줄바꿈을 빼고)을 통째로 가리는 상한 — 넘는 줄은 내용 없이 표시 줄로 바뀐다
+	redactBlockLimit = 64 << 10 // 줄을 이만큼 모아 한 번에 거른다
+	pemSwallowLimit  = 64 << 10 // END 없는 PEM 을 삼키는 상한
+	oscLengthLimit   = 4 << 10  // 끝 표시 없는 OSC 를 삼키는 상한
+	maskPrefix       = "[가림:"
 )
 
 // CapturedOutput — 가리고 줄인 출력. agent 의 실패 봉투(error.output)에 이 꼴로 실린다.
@@ -63,7 +60,9 @@ type OutputCapture struct {
 
 	// 줄로 모으기 · 가림
 	line         []byte // 아직 줄바꿈을 만나지 않은 글
-	searchedLine int    // line 에서 줄바꿈을 찾아 본 곳까지
+	searchedLine int    // line 에서 줄바꿈을 찾아 본 곳까지(1바이트씩 써도 처음부터 다시 찾지 않는다)
+	longLine     int64  // 0 보다 크면 지금 줄이 longLineLimit 를 넘었다 — 모으지 않고 바이트만 센다
+	longOmitted  int64  // 긴 줄로 버린 바이트의 합
 	block        []byte // 가릴 차례를 기다리는 온전한 줄들
 	insidePem    bool
 	pemSwallowed int
@@ -80,17 +79,19 @@ func NewOutputCapture() *OutputCapture { return &OutputCapture{redactions: map[s
 // Write — 늘 받은 만큼 받는다(오류가 없다).
 func (capture *OutputCapture) Write(chunk []byte) (int, error) {
 	capture.clean(chunk, false)
-	capture.drainLines(false)
+	capture.drainLines()
 	return len(chunk), nil
 }
 
 func (capture *OutputCapture) Finish() CapturedOutput {
 	capture.clean(nil, true)
-	capture.drainLines(true)
-	if len(capture.line) > 0 {
+	capture.drainLines()
+	if capture.longLine > 0 {
+		capture.takeLongLine(capture.longLine+int64(len(capture.line)), false)
+	} else if len(capture.line) > 0 {
 		capture.takeSegment(capture.line, false)
-		capture.line = nil
 	}
+	capture.line = nil
 	capture.flushBlock()
 
 	redactions := make(map[string]int, len(capture.redactions))
@@ -98,7 +99,7 @@ func (capture *OutputCapture) Finish() CapturedOutput {
 		redactions[kind] = count
 	}
 	if capture.total <= FailureOutputLimit {
-		return CapturedOutput{Text: string(capture.window), Redactions: redactions}
+		return CapturedOutput{Text: string(capture.window), Truncated: capture.longOmitted > 0, OmittedBytes: capture.longOmitted, Redactions: redactions}
 	}
 
 	head := capture.head[:cutHead(capture.head)]
@@ -117,7 +118,7 @@ func (capture *OutputCapture) Finish() CapturedOutput {
 	text.WriteString(separator)
 	text.WriteString(omittedMarker(omitted))
 	text.Write(tail)
-	return CapturedOutput{Text: text.String(), Truncated: true, OmittedBytes: omitted, Redactions: redactions}
+	return CapturedOutput{Text: text.String(), Truncated: true, OmittedBytes: omitted + capture.longOmitted, Redactions: redactions}
 }
 
 // CaptureOutput — 글 하나를 한 번에 가리고 줄인다.
@@ -283,66 +284,52 @@ func (capture *OutputCapture) clean(chunk []byte, finishing bool) {
 
 // ---- 줄로 모으기 ----
 
-// drainLines — line 에서 온전한 줄을 떼어 낸다. 줄바꿈 없이 linePieceLimit 를 넘으면 조각으로 나눈다 —
-// 나누는 자리 뒤를 pieceLookAhead 만큼 더 받은 뒤에(finishing 이면 있는 만큼으로) 자리에 걸친 맞음이 없게 자리를 당긴다.
-func (capture *OutputCapture) drainLines(finishing bool) {
+// drainLines — line 에서 온전한 줄을 떼어 낸다. 줄은 longLineLimit 까지 통째로 모은다 — 그보다 길어지면 더 모으지 않고
+// 줄이 끝날 때까지 바이트만 세다가 표시 줄 하나로 바꾼다(줄바꿈 없는 큰 출력도 메모리가 늘지 않는다).
+func (capture *OutputCapture) drainLines() {
 	for {
+		if capture.longLine > 0 {
+			newline := bytes.IndexByte(capture.line, '\n')
+			if newline < 0 {
+				capture.longLine += int64(len(capture.line))
+				capture.line = capture.line[:0]
+				break
+			}
+			capture.takeLongLine(capture.longLine+int64(newline), true)
+			capture.line = capture.line[newline+1:]
+			continue
+		}
 		if newline := bytes.IndexByte(capture.line[capture.searchedLine:], '\n'); newline >= 0 {
 			end := capture.searchedLine + newline + 1
-			capture.takeSegment(capture.line[:end], true)
+			if end-1 > longLineLimit {
+				capture.takeLongLine(int64(end-1), true)
+			} else {
+				capture.takeSegment(capture.line[:end], true)
+			}
 			capture.line, capture.searchedLine = capture.line[end:], 0
 			continue
 		}
 		capture.searchedLine = len(capture.line)
-		if len(capture.line) <= linePieceLimit || (!finishing && len(capture.line) < linePieceLimit+pieceLookAhead) {
-			break
+		if len(capture.line) > longLineLimit {
+			capture.longLine, capture.searchedLine = int64(len(capture.line)), 0
+			capture.line = capture.line[:0]
 		}
-		cut := pieceCut(capture.line)
-		capture.takeSegment(capture.line[:cut], false)
-		capture.line = capture.line[cut:]
-		capture.searchedLine = len(capture.line)
+		break
 	}
 	if len(capture.line) == 0 {
 		capture.line = capture.line[:0:0] // 다 쓴 배열을 놓아준다
 	}
 }
 
-// pieceCut — 줄바꿈 없는 긴 글을 나눌 자리: 첫 64KB 의 마지막 4KB 안의 마지막 공백 · 탭 뒤, 없으면 64KB 의 글자 경계.
-// 그 자리에 걸친 가림의 맞음(비밀 칸의 이름부터 값까지 · 토큰 · 주소 …)이 있으면 그 맞음의 처음으로 당긴다 — 맞음 전체가 다음 조각에 든다.
-func pieceCut(text []byte) int {
-	limit := runeBoundaryBefore(text, linePieceLimit)
-	cut := limit
-	if space := bytes.LastIndexAny(text[limit-linePieceSpaceSpan:limit], " \t"); space >= 0 {
-		cut = limit - linePieceSpaceSpan + space + 1
+// takeLongLine — longLineLimit 를 넘은 줄(length 바이트 — 줄바꿈을 빼고)을 내용 없이 표시 줄로 바꾼다. 줄바꿈은 입력대로.
+func (capture *OutputCapture) takeLongLine(length int64, endsLine bool) {
+	capture.longLine = 0
+	capture.longOmitted += length
+	marker := fmt.Sprintf("[긴 한 줄 %d바이트를 버렸다]", length)
+	if endsLine {
+		marker += "\n"
 	}
-	return settleCut(text, cut)
-}
-
-// settleCut — cut 둘레(앞 pieceLookBehind · 뒤 pieceLookAhead)에서 모든 규칙의 맞음을 찾아, cut 에 걸친 맞음이 없을 때까지 cut 을 그 처음으로 당긴다.
-// 단순화: 둘레 창보다 긴 맞음(8KB 넘게 앞에서 시작한 값 · 토큰)은 창의 처음까지만 당긴다 — 그 너머로는 나눈 채 가린다.
-func settleCut(text []byte, cut int) int {
-	windowStart := max(0, cut-pieceLookBehind)
-	window := text[windowStart:min(len(text), cut+pieceLookAhead)]
-	lowered := asciiLower(window)
-	var spans []redactionSpan
-	for _, rule := range redactionRules {
-		if rule.mayMatch(lowered) {
-			spans = append(spans, rule.find(window, lowered)...)
-		}
-	}
-	relative := cut - windowStart
-	for moved := true; moved; {
-		moved = false
-		for _, span := range spans {
-			if span.start < relative && relative < span.end {
-				relative, moved = span.start, true
-			}
-		}
-	}
-	if windowStart+relative <= 0 {
-		return cut // 빈 조각은 만들지 않는다
-	}
-	return windowStart + relative
+	capture.takeSegment([]byte(marker), endsLine)
 }
 
 var (
@@ -351,7 +338,7 @@ var (
 	pemEnd    = regexp.MustCompile(`-----END [A-Z0-9 ]{1,64}-----`)
 )
 
-// takeSegment — 온전한 줄(endsLine) 또는 긴 줄의 조각 하나. PEM 덩어리는 여기서 표시 하나로 바꾸고, 나머지는 묶음에 모은다.
+// takeSegment — 온전한 줄(endsLine) 또는 줄바꿈 없는 마지막 줄. PEM 덩어리는 여기서 표시 하나로 바꾸고, 나머지는 묶음에 모은다.
 func (capture *OutputCapture) takeSegment(segment []byte, endsLine bool) {
 	if capture.insidePem {
 		if location := pemEnd.FindIndex(segment); location != nil {
@@ -385,7 +372,7 @@ func (capture *OutputCapture) takeSegment(segment []byte, endsLine bool) {
 	}
 	capture.block = append(capture.block, segment...)
 	if !endsLine || len(capture.block) >= redactBlockLimit {
-		capture.flushBlock() // 조각은 다음 조각과 이어 가리지 않는다
+		capture.flushBlock()
 	}
 }
 
@@ -423,9 +410,8 @@ type redactionRule struct {
 	find     func(line, lowered []byte) []redactionSpan
 }
 
-// redactionSpan — 맞음 하나: [start, end) 가 맞은 글 전체(이름 · 구분자 포함 — 조각을 나눌 때 걸치지 않게 할 자리),
-// [valueStart, valueEnd) 가 표시로 바꿀 값.
-type redactionSpan struct{ start, end, valueStart, valueEnd int }
+// redactionSpan — 맞음 하나에서 표시로 바꿀 값 [start, end). 맞음끼리 겹칠 수 있다(합쳐서 가린다).
+type redactionSpan struct{ start, end int }
 
 var redactionRules = []redactionRule{
 	{"token", containsAny(tokenNeedles...), findTokens},
@@ -447,13 +433,16 @@ var (
 	bearerPattern        = regexp.MustCompile(`(?i)\bbearer[ \t]+([^ \t"'\n,;]+)`)
 	urlCredentialPattern = regexp.MustCompile(`://([^/ \t\n"'@:]*:[^/ \t\n"'@]+)@`)
 	// 비밀 낱말 바로 뒤에서 맞춰 보는 칸의 나머지: 구분 · 값. 낱말 바로 뒤에 이름의 글자가 오면 맞지 않는다 — 이름이 비밀 낱말로 끝날 때만.
-	// 따옴표 안의 값은 역빗금 이스케이프를 따라 닫는 따옴표까지.
-	secretFieldRest = regexp.MustCompile(`^["']?[ \t]*[:=][ \t]*(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|([^ \t"'&,;\n]+))`)
+	// 따옴표 안의 값은 역빗금 이스케이프를 따라 닫는 따옴표까지 — 닫는 따옴표가 없으면 줄 끝까지.
+	secretFieldRest = regexp.MustCompile(`^["']?[ \t]*[:=][ \t]*` + quotedOrBareValue + `)`)
 	// 긴 옵션의 값(`--password <값>`) — `-` 로 시작하는 다음 옵션은 값이 아니다.
 	longOptionRest = regexp.MustCompile(`^[ \t]+([^- \t"'\n][^ \t"'\n]*)`)
-	dockerLogin    = regexp.MustCompile(`\bdocker[ \t]+login\b[^\n]*?[ \t]-p[ \t]+([^ \t\n]+)`)
+	dockerLogin    = regexp.MustCompile(`\bdocker[ \t]+login\b[^\n]*?[ \t]-p[ \t]+` + quotedOrBareValue + `)`)
 	emailDomain    = regexp.MustCompile(`^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}`) // '@' 바로 뒤에서 맞춰 본다
 )
+
+// quotedOrBareValue — 값: 따옴표 안(역빗금 이스케이프를 따라 닫는 따옴표까지, 없으면 줄 끝까지) 또는 구분 글자까지. 여는 묶음 `(?:` 은 닫지 않은 채 — 쓰는 쪽이 `)` 로 닫는다.
+const quotedOrBareValue = `(?:"((?:[^"\\\n]|\\.)*)"?|'((?:[^'\\\n]|\\.)*)'?|([^ \t"'&,;\n]+)`
 
 var internalPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("172.16.0.0/12"), netip.MustParsePrefix("192.168.0.0/16"),
@@ -501,18 +490,23 @@ func redactBlock(block []byte, redactions map[string]int) []byte {
 	return block
 }
 
-// replaceSpans — 맞음의 값을 표시로 바꾼다. 빈 값 · 값 전체가 정확히 표시 하나인 것은 그대로 둔다(같은 글을 두 번 거쳐도 같다).
+// replaceSpans — 맞음의 값을 표시로 바꾼다. 겹치는 값은 합쳐 표시 하나로. 빈 값 · 값 전체가 정확히 표시 하나인 것은 그대로 둔다.
+// 다시 거치면 가림이 늘 수는 있어도(표시가 새 낱말 경계를 만든다) 줄지 않고, 가린 값이 되살아나지 않는다.
 func replaceSpans(line []byte, spans []redactionSpan, kind string) ([]byte, int) {
+	sort.Slice(spans, func(left, right int) bool { return spans[left].start < spans[right].start })
 	var result []byte
 	previous, count := 0, 0
-	for _, span := range spans {
-		value := line[span.valueStart:span.valueEnd]
-		if len(value) == 0 || isExactMask(value) {
+	for index := 0; index < len(spans); {
+		start, end := spans[index].start, spans[index].end
+		for index++; index < len(spans) && spans[index].start < end; index++ {
+			end = max(end, spans[index].end)
+		}
+		if start == end || isExactMask(line[start:end]) {
 			continue
 		}
-		result = append(result, line[previous:span.valueStart]...)
+		result = append(result, line[previous:start]...)
 		result = append(result, maskPrefix+kind+"]"...)
-		previous = span.valueEnd
+		previous = end
 		count++
 	}
 	if count == 0 {
@@ -574,37 +568,35 @@ func occurrences(lowered []byte, needles []string) [][2]int {
 	return found
 }
 
-// findPatternValues — 정규식의 맞음과 그 첫 잡힌 묶음(값). 여러 정규식의 맞음은 앞의 것과 겹치면 버린다. RE2 라 한 번 훑기다.
+// findPatternValues — 정규식의 맞음마다 처음으로 잡힌 묶음(값). RE2 라 한 번 훑기다.
 func findPatternValues(patterns ...*regexp.Regexp) func([]byte, []byte) []redactionSpan {
 	return func(line, _ []byte) []redactionSpan {
 		var spans []redactionSpan
 		for _, pattern := range patterns {
 			for _, match := range pattern.FindAllSubmatchIndex(line, -1) {
-				if match[2] >= 0 {
-					spans = append(spans, redactionSpan{match[0], match[1], match[2], match[3]})
+				if start, end := firstGroup(match); start >= 0 {
+					spans = append(spans, redactionSpan{start, end})
 				}
 			}
 		}
-		return nonOverlapping(spans)
+		return spans
 	}
 }
 
-func nonOverlapping(spans []redactionSpan) []redactionSpan {
-	sort.SliceStable(spans, func(left, right int) bool { return spans[left].start < spans[right].start })
-	kept := spans[:0]
-	end := 0
-	for _, span := range spans {
-		if span.start >= end {
-			kept = append(kept, span)
-			end = span.end
+// firstGroup — 맞음에서 처음으로 잡힌 묶음의 자리(없으면 -1).
+func firstGroup(match []int) (int, int) {
+	for group := 2; group+1 < len(match); group += 2 {
+		if match[group] >= 0 {
+			return match[group], match[group+1]
 		}
 	}
-	return kept
+	return -1, -1
 }
 
 // ---- 토큰 ----
 
-// tokenShape — 접두어(대소문자 그대로) + 허용 글자의 연속. 연속이 minimum 이상이면 접두어부터 연속의 끝까지가 토큰이다.
+// tokenShape — 접두어(대소문자 그대로) + 허용 글자의 연속. 연속이 minimum 이상이면 접두어부터 연속의 끝까지가 토큰이다
+// (허용 글자에 _ 가 있어 이어 붙은 토큰 `ghp_…ghp_…` 도 하나로 가린다).
 type tokenShape struct {
 	prefix       string
 	allowed      func(byte) bool
@@ -619,22 +611,21 @@ func isUpperOrDigit(value byte) bool {
 	return (value >= '0' && value <= '9') || (value >= 'A' && value <= 'Z')
 }
 func isTokenByte(value byte) bool   { return isAlphanumeric(value) || value == '_' || value == '-' }
-func isWordOrDash(value byte) bool  { return isAlphanumeric(value) || value == '-' }
 func isUnderscored(value byte) bool { return isAlphanumeric(value) || value == '_' }
 func isSlackPathByte(value byte) bool {
 	return isAlphanumeric(value) || value == '/' || value == '_' || value == '-'
 }
 
 var tokenShapes = []tokenShape{
-	{"ghp_", isAlphanumeric, 36, false}, {"gho_", isAlphanumeric, 36, false}, {"ghu_", isAlphanumeric, 36, false},
-	{"ghs_", isAlphanumeric, 36, false}, {"ghr_", isAlphanumeric, 36, false},
+	{"ghp_", isUnderscored, 36, false}, {"gho_", isUnderscored, 36, false}, {"ghu_", isUnderscored, 36, false},
+	{"ghs_", isUnderscored, 36, false}, {"ghr_", isUnderscored, 36, false},
 	{"github_pat_", isUnderscored, 22, false},
 	{"sk-", isTokenByte, 20, false},
 	{"AKIA", isUpperOrDigit, 16, true}, {"ASIA", isUpperOrDigit, 16, true},
-	{"xoxa-", isWordOrDash, 10, false}, {"xoxb-", isWordOrDash, 10, false}, {"xoxp-", isWordOrDash, 10, false},
-	{"xoxr-", isWordOrDash, 10, false}, {"xoxs-", isWordOrDash, 10, false},
+	{"xoxa-", isTokenByte, 10, false}, {"xoxb-", isTokenByte, 10, false}, {"xoxp-", isTokenByte, 10, false},
+	{"xoxr-", isTokenByte, 10, false}, {"xoxs-", isTokenByte, 10, false},
 	{"AIza", isTokenByte, 35, false},
-	{"npm_", isAlphanumeric, 36, true},
+	{"npm_", isUnderscored, 36, true},
 }
 
 const slackWebhookPrefix = "hooks.slack.com/services/"
@@ -655,7 +646,7 @@ func findTokens(line, lowered []byte) []redactionSpan {
 			valueStart := start + len(slackWebhookPrefix)
 			end := runEnd(line, valueStart, isSlackPathByte)
 			if end > valueStart {
-				spans = append(spans, redactionSpan{start, end, valueStart, end})
+				spans = append(spans, redactionSpan{valueStart, end})
 				previous = end
 			}
 			continue
@@ -672,7 +663,7 @@ func findTokens(line, lowered []byte) []redactionSpan {
 				jwtSkipUntil = firstSegmentEnd
 				continue
 			}
-			spans = append(spans, redactionSpan{start, end, start, end})
+			spans = append(spans, redactionSpan{start, end})
 			previous = end
 			continue
 		}
@@ -685,7 +676,7 @@ func findTokens(line, lowered []byte) []redactionSpan {
 			if end-bodyStart < shape.minimum || (shape.wordEndAfter && end < len(line) && isWordByte(line[end])) {
 				break
 			}
-			spans = append(spans, redactionSpan{start, end, start, end})
+			spans = append(spans, redactionSpan{start, end})
 			previous = end
 			break
 		}
@@ -724,9 +715,11 @@ func jwtEnd(line []byte, start int) (end int, firstSegmentEnd int) {
 
 // secretWords — 이름(소문자로)이 이 낱말로 끝나면 비밀 칸이다. 한글 이름은 그대로.
 var secretWords = []string{"password", "passwd", "secret", "token", "api_key", "apikey", "api-key",
-	"access_key", "accesskey", "access-key", "private_key", "privatekey", "private-key", "비밀번호", "패스워드", "암호"}
+	"access_key", "accesskey", "access-key", "private_key", "privatekey", "private-key",
+	"secret_key", "secretkey", "secret-key", "secret_key_base", "secretkeybase", "secret-key-base", "비밀번호", "패스워드", "암호"}
 
 // shortSecretWords — 이름의 끝 마디가 정확히 이것일 때만(pass 는 앞에 다른 마디가 있을 때만) · 값이 숫자만이면 남긴다(시험 수 등).
+// 혼자 선 pwd 는 값이 / 로 시작하면 남긴다(env 덤프의 PWD=/app).
 var shortSecretWords = []string{"pass", "pwd"}
 
 var secretFieldNeedles = append(append([]string{"docker"}, secretWords...), shortSecretWords...)
@@ -739,6 +732,7 @@ const (
 func isNameByte(value byte) bool { return isTokenByte(value) || value == '.' }
 
 // findSecretFields — 이름이 비밀 낱말로 끝나는 칸의 값. 낱말이 나온 자리에서만 맞춰 보고, 맞은 칸 안의 자리는 건너뛴다.
+// docker login 의 -p 값은 따로 찾는다(칸 · 긴 옵션과 겹쳐도 버리지 않는다 — replaceSpans 가 합친다).
 func findSecretFields(line, lowered []byte) []redactionSpan {
 	var spans []redactionSpan
 	previous := 0
@@ -749,20 +743,25 @@ func findSecretFields(line, lowered []byte) []redactionSpan {
 		}
 		word := string(lowered[wordStart:wordEnd])
 		short := word == "pass" || word == "pwd"
-		spanStart := wordStart
+		before := byte(' ')
+		if wordStart > 0 {
+			before = line[wordStart-1]
+		}
+		separated := before == '_' || before == '-' || before == '.'
 		if short {
-			before := byte(' ')
-			if wordStart > 0 {
-				before = line[wordStart-1]
-			}
-			separated := before == '_' || before == '-' || before == '.'
 			if word == "pass" && !(separated && wordStart >= 2 && isAlphanumeric(line[wordStart-2])) {
 				continue // pass 는 앞에 다른 마디가 있을 때만(PASS: · pass=12 는 시험 결과다)
 			}
 			if word == "pwd" && !separated && isAlphanumeric(before) {
 				continue // cwd 같은 낱말의 끝
 			}
-			spanStart = max(0, wordStart-2)
+		}
+		if wordEnd < len(line) && line[wordEnd] == '>' && !short { // XML `<이름>값</이름>`
+			if valueStart, valueEnd, found := xmlElementValue(line, wordStart, wordEnd); found {
+				spans = append(spans, redactionSpan{valueStart, valueEnd})
+				previous = valueEnd
+			}
+			continue
 		}
 		restStart := wordEnd
 		for bytes.HasPrefix(line[restStart:], []byte(replacementRune)) { // 이름 안에 낀 제어 문자(정리 뒤의 U+FFFD)
@@ -782,28 +781,50 @@ func findSecretFields(line, lowered []byte) []redactionSpan {
 			if match = longOptionRest.FindSubmatchIndex(line[restStart:]); match == nil {
 				continue
 			}
-			spanStart = optionStart
 		}
-		valueStart, valueEnd := -1, -1
-		for group := 2; group+1 < len(match); group += 2 {
-			if match[group] >= 0 {
-				valueStart, valueEnd = restStart+match[group], restStart+match[group+1]
-				break
-			}
-		}
-		if valueStart < 0 || (short && allDigits(line[valueStart:valueEnd])) {
+		valueStart, valueEnd := firstGroup(match)
+		if valueStart < 0 {
 			continue
 		}
-		end := restStart + match[1]
-		spans = append(spans, redactionSpan{spanStart, end, valueStart, valueEnd})
-		previous = end
+		valueStart, valueEnd = restStart+valueStart, restStart+valueEnd
+		value := line[valueStart:valueEnd]
+		if short && (allDigits(value) || (word == "pwd" && !separated && bytes.HasPrefix(value, []byte("/")))) {
+			continue
+		}
+		spans = append(spans, redactionSpan{valueStart, valueEnd})
+		previous = restStart + match[1]
 	}
 	if bytes.Contains(lowered, []byte("docker")) {
 		for _, match := range dockerLogin.FindAllSubmatchIndex(line, -1) {
-			spans = append(spans, redactionSpan{match[0], match[1], match[2], match[3]})
+			if start, end := firstGroup(match); start >= 0 {
+				spans = append(spans, redactionSpan{start, end})
+			}
 		}
 	}
-	return nonOverlapping(spans)
+	return spans
+}
+
+// xmlElementValue — `<이름>값</이름>`(같은 줄 · 여는 이름과 닫는 이름이 같다)의 값. 이름은 낱말로 끝난다(wordEnd 바로 뒤가 '>').
+// 값은 다음 '<' 까지 — 훑기는 다음 '<' 에서 멈추므로 자리마다 겹치지 않는다. 빈 값은 아니다.
+func xmlElementValue(line []byte, wordStart, wordEnd int) (int, int, bool) {
+	nameStart := wordStart
+	for nameStart > 0 && wordStart-nameStart < longOptionNameLimit && isNameByte(line[nameStart-1]) {
+		nameStart--
+	}
+	if nameStart == 0 || line[nameStart-1] != '<' {
+		return 0, 0, false
+	}
+	valueStart := wordEnd + 1
+	valueEnd := bytes.IndexByte(line[valueStart:], '<')
+	if valueEnd <= 0 {
+		return 0, 0, false
+	}
+	valueEnd += valueStart
+	closing := "</" + string(line[nameStart:wordEnd]) + ">"
+	if !bytes.HasPrefix(line[valueEnd:], []byte(closing)) {
+		return 0, 0, false
+	}
+	return valueStart, valueEnd, true
 }
 
 func allDigits(value []byte) bool {
@@ -841,7 +862,7 @@ func findEmails(line, _ []byte) []redactionSpan {
 			continue
 		}
 		end := at + 1 + domain[1]
-		spans = append(spans, redactionSpan{start, end, start, end})
+		spans = append(spans, redactionSpan{start, end})
 		previous, offset = end, end
 	}
 	return spans
@@ -888,7 +909,7 @@ func findLongHex(line, _ []byte) []redactionSpan {
 			digits = digits[2:]
 		}
 		if len(digits) >= longHexLength && allHex(digits) && digestLength(line[:start]) != len(digits) {
-			spans = append(spans, redactionSpan{start, end, start, end})
+			spans = append(spans, redactionSpan{start, end})
 		}
 		start = end
 	}
@@ -904,12 +925,14 @@ func allHex(value []byte) bool {
 	return true
 }
 
-// digestLength — 바로 앞이 다이제스트의 이름(`sha256:` 등)이면 그 이름이 요구하는 길이, 아니면 0.
+// digestLength — 바로 앞이 다이제스트의 이름(`sha256:` 등 — 그 앞은 낱말 글자가 아니다)이면 그 이름이 요구하는 길이, 아니면 0.
 func digestLength(before []byte) int {
 	lowered := asciiLower(before[max(0, len(before)-8):])
 	for prefix, length := range digestLengths {
 		if bytes.HasSuffix(lowered, []byte(prefix)) {
-			return length
+			if nameStart := len(before) - len(prefix); nameStart == 0 || !isWordByte(before[nameStart-1]) {
+				return length
+			}
 		}
 	}
 	return 0
@@ -954,14 +977,14 @@ func findInternalAddresses(line, _ []byte) []redactionSpan {
 			}
 			if parts == 4 && end-start <= 15 {
 				if address, err := netip.ParseAddr(string(line[start:end])); err == nil && isInternal(address) {
-					spans = append(spans, redactionSpan{start, end, start, end})
+					spans = append(spans, redactionSpan{start, end})
 				}
 			}
 			index = end
 			continue
 		}
 		if end, found := internalIPv6At(line, index); found {
-			spans = append(spans, redactionSpan{index, end, index, end})
+			spans = append(spans, redactionSpan{index, end})
 			index = end
 			continue
 		}

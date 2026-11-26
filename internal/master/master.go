@@ -67,6 +67,7 @@ type Master struct {
 	clock              func() time.Time // 실패 출력의 남긴 시각 · 보관 기간 판정 — 테스트가 바꾼다
 	outputDirectory    string           // 실패 출력을 남기는 폴더(failure_output.go)
 	outputMutex        sync.Mutex       // 실패 출력의 저장 · 정리를 하나씩
+	nextSequence       int64            // 다음 실패 출력의 저장 번호(outputMutex 안에서만)
 }
 
 // New — 이력 DB를 열고, 지난 실행에서 끝나지 못한 건을 실패로 닫는다. DB를 못 열면 뜨지 않는다(fail-closed).

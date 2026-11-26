@@ -45,19 +45,27 @@ type failureOutput struct {
 	Redactions   map[string]int `json:"redactions"`
 }
 
+// failureOutputFile — 저장하는 파일: 조회 응답의 칸 + 저장 번호(남긴 차례 — 조회 응답에는 싣지 않는다).
+type failureOutputFile struct {
+	failureOutput
+	Sequence int64 `json:"sequence"`
+}
+
 // expiredFailureOutput — 지운 자리의 표지(출력 없음). 410 "지워짐" 과 404 "남기지 못함" 을 가른다.
 type expiredFailureOutput struct {
 	RequestID   string `json:"request_id"`
 	FailedStage string `json:"failed_stage"`
 	RecordedAt  string `json:"recorded_at"`
 	ExpiredAt   string `json:"expired_at"`
+	Sequence    int64  `json:"sequence"`
 }
 
-// storedFailureOutput — 읽은 파일: 출력이 있으면 Output 이, 표지면 ExpiredAt 이 찬다.
+// storedFailureOutput — 읽은 파일: 출력이 있으면 Output 이, 표지면 ExpiredAt 이 찬다. 번호가 없는 파일(이 칸 이전의 꼴)은 0.
 type storedFailureOutput struct {
 	failureOutput
 	Output    *string `json:"output"`
 	ExpiredAt string  `json:"expired_at"`
+	Sequence  int64   `json:"sequence"`
 }
 
 func failureOutputDirectory(databasePath string) string {
@@ -79,7 +87,7 @@ func (master *Master) prepareFailureOutputs() {
 	}
 	master.outputMutex.Lock()
 	defer master.outputMutex.Unlock()
-	master.cleanFailureOutputs("boot", "")
+	master.cleanFailureOutputs("boot") // 폴더의 가장 큰 저장 번호도 여기서 읽는다
 }
 
 // keepFailureOutput — agent 단계의 실패 출력을 가린 뒤 남긴다(agent 가 가렸어도 한 번 더 — agent 를 믿지 않는다).
@@ -108,10 +116,12 @@ func (master *Master) keepFailureOutput(deployment Deployment, stage, detail str
 
 	master.outputMutex.Lock()
 	defer master.outputMutex.Unlock()
-	if err := writeFileAtomically(master.outputDirectory, deployment.RequestID+".json", record); err != nil {
+	sequence := max(master.nextSequence, 1)
+	master.nextSequence = sequence + 1
+	if err := writeFileAtomically(master.outputDirectory, deployment.RequestID+".json", failureOutputFile{record, sequence}); err != nil {
 		master.logger.Log(deployment.RequestID, "failure output not saved: "+err.Error(), "warning")
 	}
-	master.cleanFailureOutputs(deployment.RequestID, deployment.RequestID)
+	master.cleanFailureOutputs(deployment.RequestID)
 }
 
 // writeFileAtomically — 같은 폴더의 임시 파일(0600)에 쓴 뒤 이름을 바꾼다. 읽는 쪽은 반쯤 쓴 파일을 보지 않는다.
@@ -171,9 +181,9 @@ func readFailureOutput(directory, requestID string) (storedFailureOutput, error)
 
 // cleanFailureOutputs — 보관(14일 또는 최근 50건)을 넘은 출력을 표지로 바꾸고, 90일이 지난 표지와 1시간 넘은 임시 파일을 지운다.
 // `<요청 ID 꼴>.json` 인 일반 파일 가운데 읽을 수 있는 것만 다룬다. master.outputMutex 를 쥐고 부른다.
-// 시계: 방금 남긴 것(justSaved)은 이 정리에서 지우지 않고 50건의 맨 앞에 센다 · 파일의 미래 시각은 지금으로 친다(시계가 뒤로 가도 정리가 멈추지 않는다).
-// requestID 는 로그 줄의 요청 ID 다.
-func (master *Master) cleanFailureOutputs(requestID, justSaved string) {
+// "최근 50건"은 저장 번호로 가른다(벽시계가 아니다). 기한(14일 · 표지 90일)은 적힌 시각으로 본다 — 미래의 시각은 지난 시간이 0 아래라
+// 기한으로 지우지 않는다. 읽은 파일의 가장 큰 번호(표지 포함)로 다음 번호를 잇는다. requestID 는 로그 줄의 요청 ID 다.
+func (master *Master) cleanFailureOutputs(requestID string) {
 	entries, err := os.ReadDir(master.outputDirectory)
 	if err != nil {
 		master.logger.Log(requestID, "failure output cleanup failed: "+err.Error(), "warning")
@@ -203,6 +213,7 @@ func (master *Master) cleanFailureOutputs(requestID, justSaved string) {
 		if err != nil {
 			continue
 		}
+		master.nextSequence = max(master.nextSequence, stored.Sequence+1)
 		if stored.ExpiredAt != "" {
 			if expiredAt, err := time.Parse(time.RFC3339Nano, stored.ExpiredAt); err == nil && now.Sub(expiredAt) > expiredMarkerRetention {
 				if err := os.Remove(filepath.Join(master.outputDirectory, entry.Name())); err != nil {
@@ -217,25 +228,19 @@ func (master *Master) cleanFailureOutputs(requestID, justSaved string) {
 		}
 		outputs = append(outputs, keptOutput{name, recordedAt, stored})
 	}
-	// 방금 남긴 것 → 적힌 시각 → 이름, 새것부터. 미래의 시각을 지금으로 쳐도 차례는 같다(같아진 것끼리는 실제 시각이 늦은 쪽이 앞) —
-	// 그래서 적힌 시각 그대로 견준다. 기한도 미래 시각이면 지난 시간이 0 아래라 지나지 않는다.
-	sort.Slice(outputs, func(left, right int) bool {
+	sort.Slice(outputs, func(left, right int) bool { // 저장 번호가 큰 것(나중에 남긴 것)부터
 		first, second := outputs[left], outputs[right]
-		if (first.requestID == justSaved) != (second.requestID == justSaved) {
-			return first.requestID == justSaved
-		}
-		if !first.recordedAt.Equal(second.recordedAt) {
-			return first.recordedAt.After(second.recordedAt)
+		if first.stored.Sequence != second.stored.Sequence {
+			return first.stored.Sequence > second.stored.Sequence
 		}
 		return first.requestID > second.requestID
 	})
 	for index, output := range outputs {
-		if output.requestID == justSaved ||
-			(index < failureOutputKeptCount && now.Sub(output.recordedAt) <= failureOutputRetention) {
+		if index < failureOutputKeptCount && now.Sub(output.recordedAt) <= failureOutputRetention {
 			continue
 		}
 		marker := expiredFailureOutput{RequestID: output.requestID, FailedStage: output.stored.FailedStage,
-			RecordedAt: output.stored.RecordedAt, ExpiredAt: now.UTC().Format(time.RFC3339Nano)}
+			RecordedAt: output.stored.RecordedAt, ExpiredAt: now.UTC().Format(time.RFC3339Nano), Sequence: output.stored.Sequence}
 		if err := writeFileAtomically(master.outputDirectory, output.requestID+".json", marker); err != nil {
 			master.logger.Log(requestID, "failure output cleanup failed: "+err.Error(), "warning")
 		}
