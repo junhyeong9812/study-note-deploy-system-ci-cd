@@ -83,16 +83,24 @@ func NewRequestID() string {
 
 // AcceptOrIssue — 인입 requestId 검증(규약 포맷을 깨는 값이면 재발행)
 func AcceptOrIssue(incoming string) string {
-	if incoming == "" || len(incoming) > 64 {
+	if !ValidRequestID(incoming) {
 		return NewRequestID()
 	}
-	for _, character := range incoming {
+	return incoming
+}
+
+// ValidRequestID — 요청 ID 의 규약 꼴(영문자 · 숫자 · - · _ 만, 1~64바이트). 로그 줄과 파일 이름에 그대로 쓸 수 있는 값이다.
+func ValidRequestID(value string) bool {
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for _, character := range value {
 		valid := character == '-' || character == '_' ||
 			(character >= '0' && character <= '9') ||
 			(character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z')
 		if !valid {
-			return NewRequestID()
+			return false
 		}
 	}
-	return incoming
+	return true
 }

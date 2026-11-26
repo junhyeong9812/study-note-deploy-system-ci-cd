@@ -150,6 +150,11 @@ func (agent *Agent) handleStage(name string, execute func(service, commitSha str
 				stage, detail = staged.stage, staged.output
 			}
 			agent.logger.Log(requestID, fmt.Sprintf("agent %s failed %s stage=%s %dms: %s", name, payload.Service, stage, tookMs, tail(detail, 200)), "error")
+			// 청한 master 에게만 실패 글 전체를 가리고 줄여 싣는다 — 옛 master(16KB 까지 읽음)에게는 지금 봉투 그대로
+			if request.Header.Get(shared.FailureOutputHeader) == shared.FailureOutputVersion {
+				shared.WriteFailWithOutput(writer, http.StatusInternalServerError, stage, tail(detail, outputTailLimit), shared.CaptureOutput(detail))
+				return
+			}
 			shared.WriteFail(writer, http.StatusInternalServerError, stage, tail(detail, outputTailLimit))
 			return
 		}

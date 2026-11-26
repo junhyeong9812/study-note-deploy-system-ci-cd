@@ -45,7 +45,7 @@ func (master *Master) handleGitCommit(writer http.ResponseWriter, request *http.
 }
 
 // relayGitRead — 비밀값 → 입력 검사(틀리면 agent 를 부르지 않는다) → 그 서비스의 agent 를 GET 으로 → 상태·봉투 그대로.
-// 배포 호출(callAgent — POST·16KB)과 따로 둔다: 읽기 상한(4MB)과 기한이 다르다.
+// 배포 호출(callAgent — POST)과 따로 둔다: 기한과 응답의 검사가 다르다.
 func (master *Master) relayGitRead(writer http.ResponseWriter, request *http.Request, agentPath string, shaFields []string,
 	requiredFields map[string]jsonKind) {
 	if !shared.SecretMatches(request, master.secret) {

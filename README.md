@@ -26,6 +26,7 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 |---|---|
 | `POST /deploy` | 접수(202). 같은 `request_id` 를 다시 보내면 새 배포 없이 기존 건의 상태를 돌려준다. 같은 서비스가 진행 중이면 409 |
 | `GET /deploys/{request_id}` | 한 건의 상태 |
+| `GET /deploys/{request_id}/output` | 실패한 배포의 가린 전체 출력 — 아래 "배포 실패의 전체 출력" |
 | `GET /deploys?service=&limit=` | 이력(최신순, 기본 50·최대 200) |
 | `GET /status` | 서비스 목록 + 최근 50건(최신순, 원소는 `/deploys` 와 같은 형태) |
 | `GET /deploys/git/commits?service=&from=&to=` | 그 서비스의 agent 저장소에서 읽은 커밋 목록(from 제외 · to 포함) — 아래 "git 조회" |
@@ -39,6 +40,50 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 - 접수 응답(202)의 칸은 그대로다. 조회 응답(`GET /deploys/{request_id}` · `GET /deploys` · `GET /status` 의 `history`)의 각 줄 맨 끝에 `requested_by` 가 늘 실린다. 이 칸을 더하기 전에 기록된 줄은 `github` 다.
 - 같은 `request_id` 의 재접수는 처음 접수의 `requested_by` 를 남긴다(덮어쓰지 않는다).
 - 이력 표의 칸 `requested_by TEXT NOT NULL DEFAULT 'github'` — 칸이 없는 옛 이력 파일에는 master 가 뜰 때 한 번 더한다(있으면 건너뜀). 더하기가 실패하면 칸이 있는지 한 번 더 보고, 있으면(함께 뜬 다른 master 가 방금 더했다) 그대로 뜬다. 그래도 없으면 master 가 뜨지 않는다.
+
+## 배포 실패의 전체 출력 — 가린 뒤 남기고 요청 ID 로 조회한다
+
+이력의 `detail` 은 출력의 끝 2000바이트뿐이다. agent 단계(`ci_fetch` · `ci_test` · `ci_build` · `cd_up` · `cd_health` · `cd_switch`)가 실패하면 그 단계의 출력 전체를 가리고 줄여 master 가 이력 옆에 남긴다.
+
+- **흐름**: master 는 `/agent/ci` · `/agent/cd` 를 부를 때마다 머리 `X-Deploy-Failure-Output: v1` 을 싣는다. agent 는 이 머리의 값이 정확히 `v1` 일 때만 단계 실패 봉투의 `error` 에 `output: {text, truncated, omitted_bytes, redactions}` 를 더한다(보내기 전에 가리고 줄인다). `detail`(가리지 않은 끝 2000바이트)은 그대로다. master 는 `output.text` 를, 없으면(옛 agent) `detail` 을 **한 번 더** 가리고 줄여(agent 를 믿지 않는다) 실패가 조회에 보이기 전에 파일로 남긴다. agent 응답은 4MB 까지 읽는다(가린 뒤 256KB 의 글이 JSON 으로 이스케이프되면 몇 배로 는다). 봉투가 아닌 응답(`unexpected_response`)의 `detail` 에는 처음 16KB 만 싣는다.
+- **남기지 않는 것**: 성공한 배포 · master 단계의 실패(`agent_unreachable` · `agent_rejected` · `store_failed` · `interrupted`).
+- **자리**: `DEPLOY_OUTPUT_DIR`(비면 `DEPLOY_DB_PATH` 의 폴더 아래 `failure-outputs` — compose 에서는 `/data/failure-outputs`, 이력 DB 와 같은 볼륨이라 컨테이너를 다시 만들어도 남는다). master 가 뜰 때 0700 으로 만든다 — 만들지 못해도 뜬다(로그 한 줄). 요청 ID 하나에 `<요청 ID>.json` 하나(0600 — 같은 폴더의 임시 파일에 쓴 뒤 이름 바꾸기).
+- **남기지 못해도**(디스크가 찼을 때 등) 배포의 결과 · 이력 · 알림은 그대로다. 로그에 `failure output not saved: <오류>` 한 줄(요청 ID 와 함께 — 출력의 내용은 싣지 않는다).
+- **상한**: 가린 뒤 256KB. 넘으면 앞 32KB(그 안의 마지막 줄바꿈까지) + `[가운데 N바이트를 버렸다]` 한 줄 + 끝(줄의 처음부터) — 무엇을 돌렸는지는 앞에, 실패의 까닭은 대개 끝에 있다. 자르기는 가린 뒤에 한다(비밀값이 자른 경계에 걸쳐 반쪽이 남지 않는다). 그 앞에 글자를 정리한다: 깨진 UTF-8 · 제어 문자는 U+FFFD, ANSI 제어열(색 코드 등)은 지우고, `\r\n` · `\r` 은 줄바꿈 하나.
+- **보관**: 14일 또는 최근 50건 가운데 먼저 닿는 쪽. 남길 때마다와 master 가 뜰 때 정리한다. 지운 자리에는 출력 없는 표지(`request_id` · `failed_stage` · `recorded_at` · `expired_at`)가 남아 "지워짐"(410)과 "남기지 못함"(404)을 가른다. 표지는 지운 때부터 90일 뒤 정리된다(그 뒤에는 404 `output_not_recorded`). 폴더 안의 `<요청 ID 꼴>.json` 이 아닌 이름 · 폴더 · 심볼릭 링크 · 읽을 수 없는 파일은 건드리지 않는다.
+
+### 가림 — 한 겹 더일 뿐이다
+
+가림은 출력에 섞인 비밀값을 줄이는 **한 겹 더**다. 1차 방어는 로그 규약이다 — 비밀값을 출력에 찍지 않는다. 가린 자리는 `[가림:<종류>]` 로 바뀌고 종류마다 센 횟수가 `redactions` 에 실린다. 이미 `[가림:` 으로 시작하는 값은 다시 가리지도 세지도 않는다. 가림은 줄 단위다(줄바꿈 없이 64KB 를 넘는 줄은 조각으로 나눠 가린다).
+
+| 종류 | 가리는 것 | 남기는 것 |
+|---|---|---|
+| `token` | GitHub 토큰(`ghp_` · `gho_` · `ghu_` · `ghs_` · `ghr_` · `github_pat_`) · `sk-` 꼴 키 · AWS 키 ID(`AKIA` · `ASIA`) · JWT | `risk-assessment` 처럼 낱말 안의 `sk-` |
+| `hex` | 16진 글자만으로 된 41자 이상의 낱말 | 40자 커밋 SHA · `sha256:` 꼴 다이제스트 |
+| `pem` | `-----BEGIN … -----` 부터 `-----END … -----` 까지(여러 줄이면 표시 한 줄) | |
+| `authorization` | `Authorization` 머리 · 칸의 값, 홀로 선 `Bearer <값>` | 방식 이름(`Bearer` · `Basic` …) |
+| `secret_field` | 이름의 마지막 마디에 password · passwd · secret · token · api_key · access_key · private_key 류가 든 칸의 값(`=` · `:` · 따옴표 · JSON · 질의 문자열) | 빈 값 · 코드 파일 이름(`token_test.go:42`) |
+| `url_credential` | URL 의 `user:pass@` · `:pass@` | |
+| `private_ip` | IPv4 10/8 · 172.16/12 · 192.168/16 · 100.64/10 · 169.254/16, IPv6 fc00::/7 · fe80::/10(첫 묶음이 네 자리로 적힌 것 · `%zone` 포함) | 문서용 대역(192.0.2/24 · 198.51.100/24 · 203.0.113/24 · 2001:db8::/32) · 127.0.0.1 · `::1` · 판 번호(`3.10.0.1.4`) · 시각 · MAC |
+| `email` | 메일 주소(`git@github.com` 꼴도 가려진다) | `@types/node@20.1.0` · `app@sha256:…` |
+
+### 조회 — `GET /deploys/{request_id}/output`
+
+인증은 다른 조회와 같은 `X-Deploy-Secret`. 응답 머리 `Content-Type: application/json; charset=utf-8` · `Cache-Control: no-store` · `X-Content-Type-Options: nosniff`. 성공(200)의 `data`: `request_id` · `service` · `commit_sha` · `failed_stage` · `recorded_at`(RFC3339Nano UTC) · `output` · `truncated` · `omitted_bytes` · `bytes`(`output` 의 바이트 수) · `redactions`.
+
+| 상황 | 상태 | `error.code` |
+|---|---|---|
+| 비밀값 없음 · 틀림 | 401 | `unauthorized` |
+| 요청 ID 가 `[A-Za-z0-9_-]{1,64}` 이 아님(경로를 잇기 전에 거절) | 422 | `invalid_request_id` |
+| 이력에 없음 | 404 | `not_found` |
+| 진행 중 | 409 | `not_finished` |
+| 성공한 배포 | 409 | `not_failed` |
+| 남긴 것이 지워짐(14일 · 50건 — 정리 전이라도 14일이 지났으면) | 410 | `output_expired` |
+| 남긴 것이 없음(master 단계의 실패 · 남기기 실패 · 이 기능 전의 실패 · 표지의 90일이 지남) | 404 | `output_not_recorded` |
+| 출력 파일을 읽지 못함(심볼릭 링크 — 따라가지 않는다 · 폴더를 쓸 수 없음 · 깨진 파일) | 500 | `output_read_failed` |
+
+- **섞인 판**: 옛 master ↔ 새 agent 는 머리를 싣지 않으므로 지금 봉투 그대로다(옛 master 의 16KB 읽기에 걸리지 않는다). 새 master ↔ 옛 agent 는 `detail`(끝 2000바이트)을 가려 남긴다. 배포 순서에 기대지 않는다.
+- **알려진 한계**: agent 의 명령 실행은 지금처럼 출력 전체를 메모리에 올린 뒤 가린다. 이력의 `detail`(끝 2000) · 알림의 몸(끝 800) · 로그의 끝부분(200)은 **가리지 않은 채** 나간다(이 조각의 범위 밖 — 따로 정한다). 첫 묶음을 줄여 적은 IPv6(`fd0::1` 꼴)는 잡지 않는다. 끝 표시 없는 PEM 은 64KB, 끝 표시 없는 OSC 제어열은 줄바꿈이나 4KB 에서 그친 것으로 본다.
 
 ## git 조회 — 읽기만 (배포 상세의 커밋·diff)
 
