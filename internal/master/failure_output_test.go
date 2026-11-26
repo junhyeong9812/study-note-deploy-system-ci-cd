@@ -330,8 +330,8 @@ func TestOldAgentWithoutOutputKeepsRedactedDetail(t *testing.T) {
 	if record.Output != "fetch with [가림:token]\nFAILED test_order" || record.Redactions["token"] != 1 {
 		t.Fatalf("output 이 없는 봉투는 detail 을 가려 남긴다: %+v", record)
 	}
-	if deployment := lookup(t, master, "gh-o5-1"); deployment.Detail != "fetch with "+token+"\nFAILED test_order" {
-		t.Fatalf("이력의 detail 은 그대로다: %q", deployment.Detail)
+	if deployment := lookup(t, master, "gh-o5-1"); deployment.Detail != "fetch with [가림:token]\nFAILED test_order" { // §22: 이력의 detail 도 가린다(12-2 에서는 "그대로")
+		t.Fatalf("이력의 detail 도 가린 글이다: %q", deployment.Detail)
 	}
 }
 

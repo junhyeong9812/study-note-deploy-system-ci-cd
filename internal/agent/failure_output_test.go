@@ -150,7 +150,8 @@ func TestFailureEnvelopeWithoutOutputRequestIsByteForByteTheSame(t *testing.T) {
 		outputs:  map[string]string{"compose up": "Error response from daemon: " + token + " rejected"},
 		failures: map[string]bool{"compose up": true},
 	}
-	want := `{"error":{"code":"cd_up","detail":"Error response from daemon: ` + token + ` rejected\nexit status 1"},"success":false}` + "\n"
+	// 봉투의 꼴(칸 · 차례)은 옛 꼴 그대로, detail 은 가린 글의 끝(§22 — 12-2b 에서 "가리지 않은 토큰"에서 바꿨다)
+	want := `{"error":{"code":"cd_up","detail":"Error response from daemon: [가림:token] rejected\nexit status 1"},"success":false}` + "\n"
 	for _, outputRequest := range []string{"", "1", "V1", "v2", "true", "v1 "} { // 없음(옛 master) · 모르는 값 → 싣지 않는다
 		recorder := postAsking(newScriptedAgent(t, failing), "/agent/cd", outputRequest)
 		if recorder.Code != 500 || recorder.Body.String() != want {

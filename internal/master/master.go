@@ -63,11 +63,12 @@ type Master struct {
 	unrecorded         map[string]Deployment
 	busyRetryInterval  time.Duration
 	storeRetryInterval time.Duration
-	gitRelayTimeout    time.Duration    // git 조회 중계(git_relay.go)의 agent 호출 기한 — 테스트가 줄인다
-	clock              func() time.Time // 실패 출력의 남긴 시각 · 보관 기간 판정 — 테스트가 바꾼다
-	outputDirectory    string           // 실패 출력을 남기는 폴더(failure_output.go)
-	outputMutex        sync.Mutex       // 실패 출력의 저장 · 정리를 하나씩
-	nextSequence       int64            // 다음 실패 출력의 저장 번호(outputMutex 안에서만)
+	gitRelayTimeout    time.Duration                          // git 조회 중계(git_relay.go)의 agent 호출 기한 — 테스트가 줄인다
+	clock              func() time.Time                       // 실패 출력의 남긴 시각 · 보관 기간 판정 — 테스트가 바꾼다
+	outputDirectory    string                                 // 실패 출력을 남기는 폴더(failure_output.go)
+	outputMutex        sync.Mutex                             // 실패 출력의 저장 · 정리를 하나씩
+	nextSequence       int64                                  // 다음 실패 출력의 저장 번호(outputMutex 안에서만)
+	redact             func(raw string) shared.CapturedOutput // 실패 글의 가림 — 테스트가 바꾼다(가림의 실패)
 }
 
 // New — 이력 DB를 열고, 지난 실행에서 끝나지 못한 건을 실패로 닫는다. DB를 못 열면 뜨지 않는다(fail-closed).
@@ -90,7 +91,7 @@ func New(logger *shared.Logger) (*Master, error) {
 	master := &Master{secret: os.Getenv("DEPLOY_SECRET"), logger: logger, agents: agents,
 		store: store, inFlight: map[string]bool{}, unrecorded: map[string]Deployment{},
 		alerts:            shared.NewAlertSender("ci-cd", logger),
-		busyRetryInterval: 15 * time.Second, storeRetryInterval: 30 * time.Second, gitRelayTimeout: gitRelayTimeout, clock: time.Now,
+		busyRetryInterval: 15 * time.Second, storeRetryInterval: 30 * time.Second, gitRelayTimeout: gitRelayTimeout, clock: time.Now, redact: shared.CaptureOutput,
 		outputDirectory: failureOutputDirectory(path)}
 	master.prepareFailureOutputs()
 	closed, err := store.FailUnfinished(StageInterrupted, "master가 진행 중에 재시작됨", now())
