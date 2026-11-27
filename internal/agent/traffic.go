@@ -1131,7 +1131,7 @@ var (
 	trafficSlots              = map[string]bool{"blue": true, "green": true, "": true}
 	trafficHealthCallers      = map[string]bool{"alert": true, "ci-agent": true}
 	trafficHealthPaths        = map[string][]string{"front": {"/"}, "backend": {"/actuator/health", "/api/health/dependencies"}, "llm-wrapper": {"/health"}, "alert": {"/health"}, "observe": {"/health"}, "admin": {"/api/health"}, "ci-master": {"/health"}, "ci-agent": {"/health"}}
-	trafficStreamRoutes       = map[string][]string{"ci-agent": {"POST /agent/ci", "POST /agent/cd"}}
+	trafficStreamRoutes       = map[string][]string{"admin": {"GET /api/traffic/stream"}, "ci-agent": {"POST /agent/ci", "POST /agent/cd"}}
 	trafficDurationBoundaries = []int64{5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 15000, 20000, 30000, 45000, 60000, 90000, 120000, 180000}
 )
 
