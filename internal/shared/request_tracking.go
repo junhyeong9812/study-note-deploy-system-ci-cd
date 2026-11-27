@@ -18,6 +18,14 @@ import (
 // RequestIDHeader — 추적의 ID 를 싣는 머리글(받기 · 다음 호출 · 응답).
 const RequestIDHeader = "X-Request-Id"
 
+// CallerServiceHeader — 우리 서비스를 부를 때 부르는 쪽의 규약 이름을 싣는 머리글(docs 통신 규약 2.2). 지도의 표시에만 쓴다 — 인증이 아니고, 앱은 들어온 값을 읽지 않는다.
+// 값은 어느 패키지가 부르는가가 정한다 — 설정 · 호스트 이름 · 들어온 요청에서 읽지 않는다.
+const (
+	CallerServiceHeader = "X-Caller-Service"
+	CallerServiceMaster = "ci-master" // 마스터(internal/master)가 부를 때
+	CallerServiceAgent  = "ci-agent"  // 에이전트(internal/agent)가 부를 때 — 서버마다 다른 SERVER_NAME(ci-agent-<서버>)이 아니다
+)
+
 // privateNetworks — nginx 의 geo $from_private 와 같은 대역(사설 · 루프백 · 링크 로컬 IPv6). 169.254/16 · 100.64/10 은 넣지 않는다.
 var privateNetworks = []netip.Prefix{
 	netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("172.16.0.0/12"),

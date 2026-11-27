@@ -56,6 +56,10 @@ type Agent struct {
 	redact       func(raw string) shared.CapturedOutput // 실패 글의 가림 — 테스트가 바꾼다(가림의 실패)
 }
 
+// servicesOutsideCallerProtocol — 규약 2.1 의 서비스 목록에 없고 앞에 nginx 가 없는 서비스 — 서비스를 더할 때 여기에 넣을지 본다.
+// 이 서비스의 배포 헬스(DEPLOY_HEALTH_<SVC>)에는 X-Caller-Service 를 싣지 않는다.
+var servicesOutsideCallerProtocol = []string{"claude"}
+
 func New(logger *shared.Logger) *Agent {
 	directories := map[string]string{}
 	composeServices := map[string]string{}
@@ -86,14 +90,27 @@ func New(logger *shared.Logger) *Agent {
 			slotDrainURLs[service][slot] = os.Getenv("DEPLOY_DRAIN_" + suffix)
 		}
 	}
+	outsideCallerProtocolHealthURLs := map[string]bool{}
+	for _, service := range servicesOutsideCallerProtocol {
+		if healthURL := healthURLs[service]; healthURL != "" {
+			outsideCallerProtocolHealthURLs[healthURL] = true
+		}
+	}
+	// 기본 이음매: 규약 밖 서비스의 헬스 주소면 X-Caller-Service 없이 본다(요청 ID 는 그대로). 시그니처는 이음매 그대로
+	waitHealthyWithCaller := func(healthURL string, budget time.Duration) error {
+		if outsideCallerProtocolHealthURLs[healthURL] {
+			return pollHealthy(healthURL, budget, "")
+		}
+		return waitHealthy(healthURL, budget)
+	}
 	return &Agent{secret: os.Getenv("DEPLOY_SECRET"), logger: logger,
 		directories: directories, composeServices: composeServices, healthURLs: healthURLs,
-		testContexts: testContexts, run: runCommand, waitHealthy: waitHealthy,
+		testContexts: testContexts, run: runCommand, waitHealthy: waitHealthyWithCaller,
 		modes: modes, slotHealthURLs: slotHealthURLs, slotDrainURLs: slotDrainURLs,
 		probeSlot: probeSlot, notifyDrain: notifyDrain,
 		probeInterval: time.Second, probeBudget: 30 * time.Second,
 		drainPollInterval: 2 * time.Second, drainLimit: 3 * time.Minute, drainWaitMargin: 70 * time.Second, drainSettle: 2 * time.Second,
-		draining: map[string]chan struct{}{}, alerts: shared.NewAlertSender("ci-cd-agent", logger),
+		draining: map[string]chan struct{}{}, alerts: shared.NewAlertSender("ci-cd-agent", logger).WithCallerService(shared.CallerServiceAgent),
 		gitProgram: "git", gitTimeout: gitReadTimeout, gitReadSlots: make(chan struct{}, gitReadConcurrency), redact: shared.CaptureOutput}
 }
 

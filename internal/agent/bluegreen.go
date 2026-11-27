@@ -93,7 +93,7 @@ func writeFileAtomically(path, content string) error {
 // probeSlot — nginx가 붙인 자리 표식과, 응답이 200인지.
 // 200이 아니어도 표식은 돌려준다: 앱이 죽어 nginx가 502를 내는 상황에서도 "nginx가 어느 자리로 보내는지"는 알 수 있다.
 func probeSlot(healthURL string) (string, error) {
-	response, err := getWithFreshTrackingID(&http.Client{Timeout: 3 * time.Second}, healthURL)
+	response, err := getWithFreshTrackingID(&http.Client{Timeout: 3 * time.Second}, healthURL, shared.CallerServiceAgent)
 	if err != nil {
 		return "", err
 	}
@@ -130,6 +130,7 @@ func notifyDrain(drainURL string) error {
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set(shared.RequestIDHeader, shared.NewTrackingID()) // 들어온 요청 없이 시작되는 호출 — 호출마다 새 추적 ID
+	request.Header.Set(shared.CallerServiceHeader, shared.CallerServiceAgent)
 	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
 	if err != nil {
 		return err
