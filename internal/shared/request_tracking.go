@@ -45,21 +45,29 @@ func NewTrackingID() string {
 // FromPrivateNetwork — 연결 주소(http.Request.RemoteAddr 꼴, "host:port")가 사설 대역 · 루프백인가.
 // 대역은 nginx 의 geo $from_private 와 같다. IPv4 를 담은 IPv6(::ffff:a.b.c.d)는 IPv4 로 본다. 영역(%eth0)은 뗀다. 판정할 수 없으면 밖이다.
 func FromPrivateNetwork(remoteAddress string) bool {
-	host, _, err := net.SplitHostPort(remoteAddress)
-	if err != nil {
+	address, ok := connectionAddress(remoteAddress)
+	if !ok {
 		return false
 	}
-	address, err := netip.ParseAddr(host)
-	if err != nil {
-		return false
-	}
-	address = address.WithZone("").Unmap()
 	for _, network := range privateNetworks {
 		if network.Contains(address) {
 			return true
 		}
 	}
 	return false
+}
+
+// connectionAddress — RemoteAddr("host:port")의 주소. 영역(%eth0)을 떼고 IPv4 를 담은 IPv6 는 IPv4 로 푼다. 읽지 못하면 ok=false.
+func connectionAddress(remoteAddress string) (netip.Addr, bool) {
+	host, _, err := net.SplitHostPort(remoteAddress)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	address, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return address.WithZone("").Unmap(), true
 }
 
 // TrackingIDFor — 그 요청의 추적 ID 를 정한다: 연결 주소가 사설 대역 · 루프백이고 X-Request-Id 가 하나뿐이며

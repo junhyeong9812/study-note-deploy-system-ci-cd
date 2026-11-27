@@ -53,7 +53,7 @@ func main() {
 	logger.Log("boot", "listening :"+port+" mode="+mode, "info")
 	server := &http.Server{ // 자원 보호 타임아웃 (리뷰 F9)
 		Addr:              ":" + port,
-		Handler:           shared.TrackRequests(logger, mux), // 모든 응답에 추적 ID(X-Request-Id) — 경로가 없는 404 도
+		Handler:           shared.TrackRequests(logger, shared.WriteAccessLines(accessLineService(mode), mux)), // 모든 응답에 추적 ID · 받은 요청마다 접속 줄(규약 3.4 — 안쪽이라 그 추적 ID 를 쓴다) — 경로가 없는 404 도
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       60 * time.Second,
@@ -65,7 +65,10 @@ func main() {
 	}
 }
 
-// accessLineService — 접속 줄의 service 칸(모드로 가른다: master → ci-master · agent → ci-agent). 뼈대: 구현 조각이 채운다.
+// accessLineService — 접속 줄의 service 칸(모드로 가른다: master → ci-master · agent → ci-agent). SERVER_NAME 에서 읽지 않는다.
 func accessLineService(mode string) string {
-	return ""
+	if mode == "master" {
+		return shared.CallerServiceMaster
+	}
+	return shared.CallerServiceAgent
 }
