@@ -64,3 +64,8 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// accessLineService — 접속 줄의 service 칸(모드로 가른다: master → ci-master · agent → ci-agent). 뼈대: 구현 조각이 채운다.
+func accessLineService(mode string) string {
+	return ""
+}

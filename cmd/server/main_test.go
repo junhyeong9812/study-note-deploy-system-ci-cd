@@ -7,6 +7,9 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -49,9 +52,67 @@ func TestServerHandlerWrapsWholeMuxWithRequestTracking(t *testing.T) {
 	if packageName, isIdent := function.X.(*ast.Ident); !isIdent || packageName.Name != "shared" {
 		t.Fatalf("Handler 는 shared.TrackRequests 여야 한다")
 	}
-	for index, want := range []string{"logger", "mux"} {
-		if argument, isIdent := callExpression.Args[index].(*ast.Ident); !isIdent || argument.Name != want {
-			t.Fatalf("shared.TrackRequests 의 %d번째 인자는 %s 여야 한다", index+1, want)
+	if argument, isIdent := callExpression.Args[0].(*ast.Ident); !isIdent || argument.Name != "logger" {
+		t.Fatalf("shared.TrackRequests 의 첫째 인자는 logger 여야 한다")
+	}
+	// 둘째 인자: 접속 줄의 감싸개가 mux 전체를 감싼다 — shared.WriteAccessLines(accessLineService(mode), mux) (⑬ T4c · 규약 3.4).
+	// TrackRequests 의 안쪽이어야 접속 줄의 request_id 가 그 요청의 추적 ID 와 같다.
+	inner, isInnerCall := callExpression.Args[1].(*ast.CallExpr)
+	if !isInnerCall {
+		t.Fatalf("shared.TrackRequests 의 둘째 인자는 shared.WriteAccessLines(accessLineService(mode), mux) 여야 한다")
+	}
+	innerFunction, isInnerSelector := inner.Fun.(*ast.SelectorExpr)
+	if !isInnerSelector || innerFunction.Sel.Name != "WriteAccessLines" || len(inner.Args) != 2 {
+		t.Fatalf("shared.TrackRequests 의 둘째 인자는 shared.WriteAccessLines(…, mux) 여야 한다")
+	}
+	if packageName, isIdent := innerFunction.X.(*ast.Ident); !isIdent || packageName.Name != "shared" {
+		t.Fatalf("WriteAccessLines 는 shared 의 것이어야 한다")
+	}
+	service, isServiceCall := inner.Args[0].(*ast.CallExpr)
+	if !isServiceCall {
+		t.Fatalf("WriteAccessLines 의 첫째 인자는 accessLineService(mode) 여야 한다")
+	}
+	if name, isIdent := service.Fun.(*ast.Ident); !isIdent || name.Name != "accessLineService" || len(service.Args) != 1 {
+		t.Fatalf("WriteAccessLines 의 첫째 인자는 accessLineService(mode) 여야 한다")
+	}
+	if argument, isIdent := service.Args[0].(*ast.Ident); !isIdent || argument.Name != "mode" {
+		t.Fatalf("accessLineService 의 인자는 mode 여야 한다")
+	}
+	if argument, isIdent := inner.Args[1].(*ast.Ident); !isIdent || argument.Name != "mux" {
+		t.Fatalf("WriteAccessLines 의 둘째 인자는 mux 여야 한다")
+	}
+}
+
+// 접속 줄의 service 는 모드로 가른다(설정의 SERVER_NAME 이 아니다 — 에이전트의 SERVER_NAME 은 ci-agent-<서버>).
+func TestAccessLineServiceByMode(t *testing.T) {
+	t.Setenv("SERVER_NAME", "ci-agent-home")
+	if got := accessLineService("master"); got != "ci-master" {
+		t.Fatalf("master → ci-master: %q", got)
+	}
+	if got := accessLineService("agent"); got != "ci-agent" {
+		t.Fatalf("agent → ci-agent: %q", got)
+	}
+}
+
+// 접속 줄이 표준 출력으로 가므로 compose 의 두 서비스에 nginx 여섯과 같은 로그 상한을 둔다(규약 3.6 — json-file · 10m · 3).
+func TestComposeBoundsLogsOfBothServices(t *testing.T) {
+	content, err := os.ReadFile("../../docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(content)
+	for _, service := range []string{"master", "agent"} {
+		start := strings.Index(text, "\n  "+service+":\n")
+		if start < 0 {
+			t.Fatalf("compose 에 %s 서비스가 없다", service)
+		}
+		block := text[start+1:]
+		if next := regexp.MustCompile(`\n  [a-z][a-z0-9_-]*:\n`).FindStringIndex(block[1:]); next != nil {
+			block = block[:next[0]+1]
+		}
+		want := regexp.MustCompile(`(?m)^    logging:[^\n]*\n      driver: json-file\n      options:\n        max-size: "10m"\n        max-file: "3"\n`)
+		if !want.MatchString(block) {
+			t.Fatalf("%s 서비스에 logging: { driver: json-file, options: { max-size: \"10m\", max-file: \"3\" } } 이 없다:\n%s", service, block)
 		}
 	}
 }
