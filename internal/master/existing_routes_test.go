@@ -42,7 +42,7 @@ func TestExistingRoutesAnswerSameAfterGitRoutes(t *testing.T) {
 	waitFinished(t, master, "gh-keep-1")
 
 	single := call(master, "GET", "/deploys/gh-keep-1", "")
-	if single.Code != 200 || strings.Join(dataKeys(t, single), ",") != "accepted_at,cd_ms,ci_ms,commit_sha,finished_at,request_id,service,state" {
+	if single.Code != 200 || strings.Join(dataKeys(t, single), ",") != "accepted_at,cd_ms,ci_ms,commit_sha,finished_at,request_id,requested_by,service,state" {
 		t.Fatalf("GET /deploys/{requestID} 의 답이 바뀌었다: %d %s", single.Code, single.Body.String())
 	}
 	listing := call(master, "GET", "/deploys?service=llm&limit=5", "")

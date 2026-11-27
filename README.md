@@ -31,6 +31,15 @@ Go 배포 서버 — **단일 바이너리, `.env`의 MODE로 master/agent 전�
 | `GET /deploys/git/commits?service=&from=&to=` | 그 서비스의 agent 저장소에서 읽은 커밋 목록(from 제외 · to 포함) — 아래 "git 조회" |
 | `GET /deploys/git/commit?service=&sha=` | 커밋 하나와 파일별 diff(첫째 부모와의 차이) — 아래 "git 조회" |
 
+### 누가 일으켰나 — `requested_by`
+
+- 접수 본문: `{"service", "commit_sha", "request_id", "requested_by"}` — `requested_by` 는 선택이다. 없거나 `null` 이거나 빈 글자면 `github`(GitHub 워크플로의 본문은 이 칸을 싣지 않는다). 사람이 일으킨 접수는 `admin:<계정>`(뒤에 `:incident:<id>` 가 붙을 수 있다).
+- 허용하는 꼴: 영문자 · 숫자 · `.` `_` `:` `-` 만, 1~128바이트. 그 밖(`@` · 공백 · 줄바꿈 · 제어 문자 · ASCII 밖 글자 · 129바이트 이상)은 접수 전에 422 `invalid_requested_by` — 이력에 남지 않고 agent 를 부르지 않는다. `@` 를 받지 않는 까닭: 값이 접수 알림의 제목에 실리고 알림 서버가 메신저로 그대로 보내므로 `@everyone` 같은 전체 호출이 될 수 있다. 글자가 아닌 값(숫자 · 참거짓 · 객체 · 배열)은 422 `invalid_request` 로 거절된다. 인증 검사가 먼저다.
+- 이 값은 접수 비밀값을 가진 쪽이 스스로 적는 값이다 — 증명이 아니다(`github` 를 적으면 접수 알림이 가지 않는다). master 는 글자와 길이만 보고 `admin:<계정>` 의 형태는 강제하지 않는다.
+- 접수 응답(202)의 칸은 그대로다. 조회 응답(`GET /deploys/{request_id}` · `GET /deploys` · `GET /status` 의 `history`)의 각 줄 맨 끝에 `requested_by` 가 늘 실린다. 이 칸을 더하기 전에 기록된 줄은 `github` 다.
+- 같은 `request_id` 의 재접수는 처음 접수의 `requested_by` 를 남긴다(덮어쓰지 않는다).
+- 이력 표의 칸 `requested_by TEXT NOT NULL DEFAULT 'github'` — 칸이 없는 옛 이력 파일에는 master 가 뜰 때 한 번 더한다(있으면 건너뜀). 더하기가 실패하면 칸이 있는지 한 번 더 보고, 있으면(함께 뜬 다른 master 가 방금 더했다) 그대로 뜬다. 그래도 없으면 master 가 뜨지 않는다.
+
 ## git 조회 — 읽기만 (배포 상세의 커밋·diff)
 
 master 에는 저장소가 없다. master 가 입력을 검사한 뒤 그 서비스의 agent 를 불러(`GET`, 같은 비밀값, 기한 4초, 응답 4MB까지) 상태·봉투를 그대로 돌려준다.
@@ -83,6 +92,7 @@ master 에는 저장소가 없다. master 가 입력을 검사한 뒤 그 서비
 `ALERT_EVENTS_URL`·`ALERT_SECRET` 이 설정돼 있으면 사람이 알아야 할 일을 알림 서버에 보낸다. 보내는 일은 배포와 분리돼 있어 실패해도 배포 결과를 바꾸지 않는다.
 
 - master: 배포가 `failed` 로 끝났을 때(서비스·단계·출력 끝부분)
+- master: `requested_by` 가 `github` 가 아닌 접수가 새로 기록됐을 때 한 건 — kind `deploy_requested` · severity `info` · key `deploy-requested:<request_id>` · 제목에 서비스와 `requested_by`, 본문에 커밋. 재접수 · 거절(409 · 422 · 기록 실패)과 GitHub 접수는 알리지 않는다. 접수 응답은 이 알림을 기다리지 않는다
 - agent: 두 자리가 남았을 수 있을 때 — 자리 정지 보류, 되돌림 미확인, 활성 파일 복원 실패
 
 ## 무중단 배포(blue/green) — 서비스별로 켠다
