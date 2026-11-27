@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"regexp"
 	"time"
 )
 
@@ -20,6 +21,18 @@ const accessLinePathLimit = 1024
 // protocolCallers — 머리글로 받는 호출자의 닫힌 목록(규약 2.2 · 3.3 의 map). edge · outside 는 머리글로 받지 않는다.
 var protocolCallers = map[string]bool{
 	"front": true, "backend": true, "llm-wrapper": true, "alert": true, "observe": true, "admin": true, "ci-master": true, "ci-agent": true,
+}
+
+// AccessLineMethodPattern — 접속 줄의 method 칸의 꼴(규약 3.4 · 관측 서버와 같은 꼴). 읽는 쪽(agent 의 파서)은 이 꼴 그대로 "" 도 받고
+// (nginx 가 요청 줄을 해석하지 못한 줄 — 3.1), 쓰는 쪽은 빈 값이 아니고 이 꼴인 메서드만 적는다(그 밖은 "").
+var AccessLineMethodPattern = regexp.MustCompile(`^[A-Z_-]{0,32}$`)
+
+// accessLineMethod — 꼴(^[A-Z_-]{1,32}$) 안의 메서드는 그대로, 그 밖(소문자 · 숫자 · 33자 이상 · 그 밖의 토큰 글자)은 "". 대문자로 바꾸지 않는다.
+func accessLineMethod(method string) string {
+	if method != "" && AccessLineMethodPattern.MatchString(method) {
+		return method
+	}
+	return ""
 }
 
 var loopbackNetworks = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("::1/128")}
@@ -119,7 +132,7 @@ func WriteAccessLines(service string, next http.Handler) http.Handler {
 			status = http.StatusOK
 		}
 		line := accessLineFields{Version: 1, Timestamp: threeDecimalSeconds(finished.UnixMilli()), RequestID: TrackingID(request.Context()),
-			Caller: CallerFor(request), Service: service, Method: request.Method, Path: path, PathTruncated: truncated, Status: status,
+			Caller: CallerFor(request), Service: service, Method: accessLineMethod(request.Method), Path: path, PathTruncated: truncated, Status: status,
 			RequestTime: threeDecimalSeconds(finished.Sub(started).Milliseconds()), BytesSent: recorder.bytesSent, Loopback: fromLoopback(request.RemoteAddr)}
 		var buffer bytes.Buffer
 		encoder := json.NewEncoder(&buffer)

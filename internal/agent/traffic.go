@@ -1123,7 +1123,7 @@ var (
 	trafficThreeDecimals      = regexp.MustCompile(`^[0-9]+\.[0-9]{3}$`)
 	trafficDigits             = regexp.MustCompile(`^[0-9]+$`)
 	trafficRequestIDPattern   = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	trafficMethodPattern      = regexp.MustCompile(`^[A-Z_-]{0,32}$`)
+	trafficMethodPattern      = shared.AccessLineMethodPattern // 쓰는 쪽(shared.WriteAccessLines)과 같은 꼴 — 읽는 쪽은 "" 도 받는다
 	trafficUpstreamTime       = regexp.MustCompile(`^(?:[0-9]+\.[0-9]{3}|-)(?:(?:, | : )(?:[0-9]+\.[0-9]{3}|-))*$`)
 	trafficUpstreamStatus     = regexp.MustCompile(`^(?:[0-9]{3}|-)(?:(?:, | : )(?:[0-9]{3}|-))*$`)
 	trafficRecordedCallers    = map[string]bool{"front": true, "backend": true, "llm-wrapper": true, "alert": true, "observe": true, "admin": true, "ci-master": true, "ci-agent": true, "edge": true, "outside": true}
