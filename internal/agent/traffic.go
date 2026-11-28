@@ -1,6 +1,6 @@
 package agent
 
-// 통신 수치 수집(⑬ T5) — 이 서버의 nginx 컨테이너의 도커 로그(접속 기록)를 30초마다 읽은 자리부터 이어 읽어,
+// 통신 수치 수집(⑬ T5) — 이 서버의 nginx 컨테이너(와 ci-cd 의 마스터 · 에이전트 — 규약 3.4)의 도커 로그(접속 기록)를 30초마다 읽은 자리부터 이어 읽어,
 // 범위 하나를 항목 하나로 Redis 스트림 traffic 에 보낸다.
 // 계약: docs/cross-cutting/plans/2026-11-25/traffic-map/requirement-spec.md "T5 착수" · "T5 설계의 선검증 반영" · "T5 테스트가 정한 세부"
 // (뒤가 앞선다) · communication-protocol.md §3.1 · §3.2 · §3.6 · §4.1~§4.4. 세부: traffic_*_test.go 머리의 주석.
@@ -1113,6 +1113,7 @@ type trafficAccessRecord struct {
 	upstreamStatus       *string
 	slot                 *string
 	bytesSent            int64
+	loopback             bool // ci-cd 앱의 줄의 15번째 칸(규약 3.4) — nginx 의 줄에는 없고 없으면 거짓(7.2)
 	class                string
 }
 
@@ -1122,7 +1123,7 @@ var (
 	trafficThreeDecimals      = regexp.MustCompile(`^[0-9]+\.[0-9]{3}$`)
 	trafficDigits             = regexp.MustCompile(`^[0-9]+$`)
 	trafficRequestIDPattern   = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	trafficMethodPattern      = regexp.MustCompile(`^[A-Z_-]{0,32}$`)
+	trafficMethodPattern      = shared.AccessLineMethodPattern // 쓰는 쪽(shared.WriteAccessLines)과 같은 꼴 — 읽는 쪽은 "" 도 받는다
 	trafficUpstreamTime       = regexp.MustCompile(`^(?:[0-9]+\.[0-9]{3}|-)(?:(?:, | : )(?:[0-9]+\.[0-9]{3}|-))*$`)
 	trafficUpstreamStatus     = regexp.MustCompile(`^(?:[0-9]{3}|-)(?:(?:, | : )(?:[0-9]{3}|-))*$`)
 	trafficRecordedCallers    = map[string]bool{"front": true, "backend": true, "llm-wrapper": true, "alert": true, "observe": true, "admin": true, "ci-master": true, "ci-agent": true, "edge": true, "outside": true}
@@ -1182,7 +1183,20 @@ func parseTrafficAccessLine(content []byte) (*trafficAccessRecord, bool) {
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) { // 뒤에 더 붙은 글자
 		return nil, false
 	}
-	if len(raw) != len(trafficAccessFieldNames) {
+	// 14칸(nginx) 또는 loopback(참 · 거짓)을 더한 15칸(ci-cd 앱 — 규약 3.4 · 7.2). 그 밖의 칸 수 · 모르는 칸은 unparsed
+	loopback := false
+	if value, present := raw["loopback"]; present {
+		switch string(value) {
+		case "true":
+			loopback = true
+		case "false":
+		default:
+			return nil, false
+		}
+		if len(raw) != len(trafficAccessFieldNames)+1 {
+			return nil, false
+		}
+	} else if len(raw) != len(trafficAccessFieldNames) {
 		return nil, false
 	}
 	text := map[string]string{}
@@ -1210,7 +1224,7 @@ func parseTrafficAccessLine(content []byte) (*trafficAccessRecord, bool) {
 	if !isText("request_id", "caller", "service", "method", "path", "upstream_time", "upstream_status", "slot") || string(raw["v"]) != "1" {
 		return nil, false
 	}
-	record := &trafficAccessRecord{requestID: text["request_id"], caller: text["caller"], service: text["service"], method: text["method"], path: text["path"]}
+	record := &trafficAccessRecord{requestID: text["request_id"], caller: text["caller"], service: text["service"], method: text["method"], path: text["path"], loopback: loopback}
 	endMilliseconds, ok := threeDecimalMilliseconds(string(raw["ts"]))
 	if !ok || endMilliseconds < 1_000_000_000_000 || endMilliseconds >= 4_000_000_000_000 {
 		return nil, false
@@ -1308,8 +1322,9 @@ func utf16Length(text string) int {
 }
 
 // classifyTrafficRequest — 규약 §3.6 의 갈래: health → stream → request(표에 없는 서비스는 request).
+// health 의 호출자 조건은 alert · ci-agent 이거나 loopback(compose 의 헬스 확인이 컨테이너 안에서 ci-cd 앱을 머리글 없이 부른다).
 func classifyTrafficRequest(record *trafficAccessRecord) string {
-	if trafficHealthCallers[record.caller] && (record.method == "GET" || record.method == "HEAD") {
+	if (trafficHealthCallers[record.caller] || record.loopback) && (record.method == "GET" || record.method == "HEAD") {
 		for _, path := range trafficHealthPaths[record.service] {
 			if record.path == path {
 				return "health"

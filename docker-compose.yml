@@ -18,6 +18,11 @@ services:
       timeout: 5s
       retries: 3
     restart: unless-stopped
+    logging:                                           # 접속 줄(통신 규약 3.4)이 표준 출력으로 간다 — nginx 여섯과 같은 상한(3.6)
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   agent:
     build: .
@@ -41,3 +46,8 @@ services:
       timeout: 5s
       retries: 3
     restart: unless-stopped
+    logging:                                           # 접속 줄(통신 규약 3.4)이 표준 출력으로 간다 — nginx 여섯과 같은 상한(3.6)
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

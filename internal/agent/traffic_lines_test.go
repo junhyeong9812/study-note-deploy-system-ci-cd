@@ -6,7 +6,7 @@ package agent
 //
 // 정한 계약:
 //   - `{"v":` 로 시작하지 않는 줄 = ignored. 시작하는데 아래에 걸리면 unparsed(묶음 · 요청별 줄 어디에도 싣지 않는다):
-//     JSON 객체가 아님(뒤에 더 붙은 글자 포함) · 겹친 칸 · 14칸(nginx)이 아님(모르는 칸 · 빠진 칸 — loopback 이 든 15칸도) ·
+//     JSON 객체가 아님(뒤에 더 붙은 글자 포함) · 겹친 칸 · 14칸(nginx) 또는 loopback(참 · 거짓)을 더한 15칸(ci-cd 앱 — 규약 3.4 · 7.2)이 아님(모르는 칸 · 빠진 칸 · 참 · 거짓이 아닌 loopback) ·
 //     v 가 정수 글자 1 이 아님 · ts 가 `^[0-9]+\.[0-9]{3}$` 의 수가 아니거나 [10억, 40억) 밖 · request_id 가 ^[A-Za-z0-9_-]{1,64}$ 밖 ·
 //     caller 가 front · backend · llm-wrapper · alert · observe · admin · ci-master · ci-agent · edge · outside 밖 ·
 //     service 가 front … ci-agent · edge 밖 · method 가 글이 아니거나 ^[A-Z_-]{0,32}$ 밖(관측 서버) · path 가 글이 아니거나 1024자를 넘거나
@@ -59,7 +59,10 @@ func TestUnparsedAndIgnoredLines(t *testing.T) {
 		"깨진 JSON":              `{"v":1,"ts":`,
 		"뒤에 더 붙은 글자":           valid.text() + ` x`,
 		"빠진 칸":                 replace(`,"slot":"blue"`, ``),
-		"모르는 칸(loopback)":      replace(`}`, `,"loopback":false}`),
+		"모르는 칸":                replace(`}`, `,"extra":false}`),
+		"loopback 이 참 · 거짓 아님": replace(`}`, `,"loopback":"true"}`),
+		"loopback 이 수":         replace(`}`, `,"loopback":1}`),
+		"loopback 과 모르는 칸":     replace(`}`, `,"loopback":false,"extra":1}`),
 		"겹친 칸":                 replace(`"slot":"blue"`, `"slot":"blue","slot":"green"`),
 		"v 2":                  replace(`{"v":1`, `{"v":2`),
 		"v 1.0":                replace(`{"v":1`, `{"v":1.0`),
