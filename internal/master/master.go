@@ -75,7 +75,7 @@ type Master struct {
 func New(logger *shared.Logger) (*Master, error) {
 	agents := map[string]string{}
 	// AGENT_URL_FRONT=http://<host>:15001 형식 — 서비스 allowlist는 이 고정 열거가 정본
-	for _, service := range []string{"front", "backend", "llm", "alert", "observe", "admin"} {
+	for _, service := range []string{"front", "backend", "llm", "alert", "observe", "admin", "claude"} {
 		if agentURL := os.Getenv("AGENT_URL_" + strings.ToUpper(service)); agentURL != "" {
 			agents[service] = agentURL
 		}

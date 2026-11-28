@@ -121,6 +121,12 @@ master 에는 저장소가 없다. master 가 입력을 검사한 뒤 그 서비
 | git 기한 초과 · git 실패 | 504 `git_timeout` · 500 `git_failed` | 그대로 |
 | agent 에 닿지 못함 · 4초 안에 답 없음 · 봉투가 아님(4MB 초과 · 성공인데 필수 칸 없음 포함) | — | 502 `agent_unreachable` · 504 `agent_timeout` · 502 `unexpected_response` |
 
+## 배포 대상
+
+서비스 이름은 `front` · `backend` · `llm` · `alert` · `observe` · `admin` · `claude` 의 고정 열거다(master 의 허용 목록 · agent 의 설정 이름 — 정확히 그 이름만 받는다). master 는 `AGENT_URL_<이름>` 이 있는 서비스만 받는다.
+
+- `claude` — Claude 실행 자리(`study-note-deploy-system-claude`). compose 서비스 `claude-runner` · **단일 컨테이너**(무중단 배포가 아니다 — 교체하는 몇 초 동안 답하지 않는다). 헬스는 그 서버의 LAN 주소 `:15200/health`(실행 자리는 15200 을 `BIND_ADDR` 에만 연다 — `127.0.0.1` 로는 닿지 않는다). 헬스가 200 이 아니면 `cd_health` 로 실패하고 되돌리지 않는다 — **구독 토큰이 그 서버의 실행 자리 `.env` 에 없으면 헬스가 503 이라 첫 배포가 실패한다**(첫 배포 전에 토큰을 둔다). 운영 설정에 둘 것 넷: master 의 `AGENT_URL_CLAUDE`(backend 와 같은 서버의 agent) · 그 agent 의 `DEPLOY_DIR_CLAUDE` · `DEPLOY_SVC_CLAUDE=claude-runner` · `DEPLOY_HEALTH_CLAUDE`(`.env.example` 의 claude 묶음). agent 의 compose 가 그 저장소 폴더를 붙인다(`docker-compose.yml`).
+
 ## 대상 repo가 지켜야 할 것
 
 - Dockerfile 에 `test` 단계 — agent 는 `docker build --target test <경로>` 만 실행한다. 무엇을 돌릴지는 repo 가 정한다.
