@@ -90,7 +90,7 @@ func New(logger *shared.Logger) (*Master, error) {
 	}
 	master := &Master{secret: os.Getenv("DEPLOY_SECRET"), logger: logger, agents: agents,
 		store: store, inFlight: map[string]bool{}, unrecorded: map[string]Deployment{},
-		alerts:            shared.NewAlertSender("ci-cd", logger),
+		alerts:            shared.NewAlertSender("ci-cd", logger).WithCallerService(shared.CallerServiceMaster),
 		busyRetryInterval: 15 * time.Second, storeRetryInterval: 30 * time.Second, gitRelayTimeout: gitRelayTimeout, clock: time.Now, redact: shared.CaptureOutput,
 		outputDirectory: failureOutputDirectory(path)}
 	master.prepareFailureOutputs()
@@ -352,6 +352,7 @@ func (master *Master) callAgent(url string, deployment Deployment, timeout time.
 	// 들어온 요청 없이 시작되는 호출 — 호출마다 새 추적 ID(409 로 다시 부르는 것도 새 값). 일의 ID 는 본문 request_id 그대로
 	trackingID, step := shared.NewTrackingID(), url[strings.LastIndex(url, "/")+1:]
 	agentRequest.Header.Set(shared.RequestIDHeader, trackingID)
+	agentRequest.Header.Set(shared.CallerServiceHeader, shared.CallerServiceMaster) // 들어온 접수의 X-Caller-Service 는 옮기지 않는다 — 자기 이름
 	response, err := (&http.Client{Timeout: timeout}).Do(agentRequest)
 	if err != nil {
 		master.logger.Log(trackingID, fmt.Sprintf("deploy %s call job=%s -> unreachable", step, deployment.RequestID), "info")

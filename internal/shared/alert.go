@@ -16,11 +16,19 @@ type AlertSender struct {
 	source string
 	logger *Logger
 	client *http.Client
+	// callerService — 보낼 때 X-Caller-Service 로 싣는 이름(WithCallerService 로 정한다 — 비어 있으면 싣지 않는다)
+	callerService string
 }
 
 func NewAlertSender(source string, logger *Logger) *AlertSender {
 	return &AlertSender{url: os.Getenv("ALERT_EVENTS_URL"), secret: os.Getenv("ALERT_SECRET"),
 		source: source, logger: logger, client: &http.Client{Timeout: 3 * time.Second}}
+}
+
+// WithCallerService — 이 보내기가 X-Caller-Service 로 실을 부르는 쪽의 규약 이름을 정한다(만든 패키지가 자기 상수를 준다). 같은 보내기를 돌려준다.
+func (sender *AlertSender) WithCallerService(callerService string) *AlertSender {
+	sender.callerService = callerService
+	return sender
 }
 
 // Send — severity: info·warning·critical. key 가 같으면 알림 서버가 10분에 한 번만 발송한다.
@@ -40,6 +48,9 @@ func (sender *AlertSender) Send(requestID, kind, severity, key, title, detail st
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("X-Alert-Secret", sender.secret)
 		request.Header.Set(RequestIDHeader, NewTrackingID()) // 들어온 요청 없이 시작되는 호출 — 보낼 때마다 새 추적 ID(로그의 ID 는 부른 쪽의 것 그대로)
+		if sender.callerService != "" {
+			request.Header.Set(CallerServiceHeader, sender.callerService)
+		}
 		response, err := sender.client.Do(request)
 		if err != nil {
 			sender.logger.Log(requestID, "alert not sent: "+err.Error(), "warning")

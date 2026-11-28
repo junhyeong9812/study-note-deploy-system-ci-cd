@@ -77,6 +77,7 @@ func (master *Master) relayGitRead(writer http.ResponseWriter, request *http.Req
 	}
 	agentRequest.Header.Set(shared.SecretHeader, master.secret)
 	agentRequest.Header.Set(shared.RequestIDHeader, requestID)
+	agentRequest.Header.Set(shared.CallerServiceHeader, shared.CallerServiceMaster) // 들어온 요청의 X-Caller-Service 는 옮기지 않는다 — 자기 이름
 	response, err := (&http.Client{Timeout: master.gitRelayTimeout}).Do(agentRequest)
 	if err != nil {
 		if isTimeout(err) {

@@ -233,22 +233,31 @@ func staleImageTags(listing, deployedSha string) []string {
 }
 
 // getWithFreshTrackingID — 들어온 요청 없이 시작되는 호출(배포 중의 헬스 · 자리 확인): 호출마다 새 추적 ID 를 싣는다.
-func getWithFreshTrackingID(client *http.Client, target string) (*http.Response, error) {
+// callerService 가 비어 있지 않으면 X-Caller-Service 로 싣는다(규약 밖 서비스의 헬스는 빈 값).
+func getWithFreshTrackingID(client *http.Client, target, callerService string) (*http.Response, error) {
 	request, err := http.NewRequest(http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
 	}
 	request.Header.Set(shared.RequestIDHeader, shared.NewTrackingID())
+	if callerService != "" {
+		request.Header.Set(shared.CallerServiceHeader, callerService)
+	}
 	return client.Do(request)
 }
 
-// waitHealthy — 배포 후 서비스 헬스가 200이 될 때까지 폴링 (기동 시간 감안)
+// waitHealthy — 배포 후 서비스 헬스가 200이 될 때까지 폴링 (기동 시간 감안). 규약 2.1 의 서비스로 보고 ci-agent 를 싣는다
 func waitHealthy(healthURL string, budget time.Duration) error {
+	return pollHealthy(healthURL, budget, shared.CallerServiceAgent)
+}
+
+// pollHealthy — waitHealthy 의 몸. callerService 가 비면 X-Caller-Service 없이 본다
+func pollHealthy(healthURL string, budget time.Duration, callerService string) error {
 	deadline := time.Now().Add(budget)
 	client := &http.Client{Timeout: 3 * time.Second}
 	var lastError error
 	for time.Now().Before(deadline) {
-		response, err := getWithFreshTrackingID(client, healthURL)
+		response, err := getWithFreshTrackingID(client, healthURL, callerService)
 		if err == nil {
 			response.Body.Close()
 			if response.StatusCode == http.StatusOK {
