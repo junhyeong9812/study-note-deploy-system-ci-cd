@@ -11,7 +11,7 @@ services:
     environment:
       DEPLOY_DB_PATH: /data/deploys.db                 # 아래 볼륨과 짝 — 작업 디렉토리에 기대지 않는다
     volumes:
-      - ./data:/data                                   # 배포 이력 DB(SQLite) — 재시작해도 남는다
+      - ./data:/data                                   # 배포 이력 DB(SQLite) · 실패 출력(/data/failure-outputs) — 재시작해도 남는다
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:15000/health"]
       interval: 30s

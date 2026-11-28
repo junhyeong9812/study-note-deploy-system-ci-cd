@@ -17,11 +17,22 @@ func WriteAccepted(writer http.ResponseWriter, data any) {
 }
 
 func WriteFail(writer http.ResponseWriter, status int, code string, detail string) {
+	writeJSON(writer, status, map[string]any{"success": false, "error": failureBody(code, detail)})
+}
+
+// WriteFailWithOutput — WriteFail 에 가리고 줄인 전체 출력(error.output)을 더한다.
+func WriteFailWithOutput(writer http.ResponseWriter, status int, code string, detail string, output CapturedOutput) {
+	errorBody := failureBody(code, detail)
+	errorBody["output"] = output
+	writeJSON(writer, status, map[string]any{"success": false, "error": errorBody})
+}
+
+func failureBody(code, detail string) map[string]any {
 	errorBody := map[string]any{"code": code}
 	if detail != "" {
 		errorBody["detail"] = detail
 	}
-	writeJSON(writer, status, map[string]any{"success": false, "error": errorBody})
+	return errorBody
 }
 
 func writeJSON(writer http.ResponseWriter, status int, body any) {

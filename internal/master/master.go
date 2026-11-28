@@ -23,6 +23,10 @@ const (
 	deliveryCallTimeout    = 9 * time.Minute                 // 앞선 정리 대기 4분 10초 + 기동·헬스·전환 4분 30초 + 여유
 	busyRetryLimit         = 12                              // agent가 다른 작업 중일 때 다시 불러 보는 횟수 — 배포 한 건 전체(CI+CD) 합계
 	detailLimit            = 2000
+	// agent 응답을 읽는 상한 — 실패 봉투의 error.output(가린 뒤 256KB)은 JSON 으로 이스케이프되면 몇 배로 는다
+	agentResponseLimit = 4 << 20
+	// 봉투가 아닌 응답을 detail 에 싣는 상한(읽기 상한을 키우기 전과 같은 16KB)
+	unexpectedResponseDetailLimit = 16 << 10
 
 	StageAgentUnreachable = "agent_unreachable"
 	StageAgentRejected    = "agent_rejected" // agent가 단계에 들어가기 전에 거절(설정 누락·작업 중 등)
@@ -59,7 +63,12 @@ type Master struct {
 	unrecorded         map[string]Deployment
 	busyRetryInterval  time.Duration
 	storeRetryInterval time.Duration
-	gitRelayTimeout    time.Duration // git 조회 중계(git_relay.go)의 agent 호출 기한 — 테스트가 줄인다
+	gitRelayTimeout    time.Duration                          // git 조회 중계(git_relay.go)의 agent 호출 기한 — 테스트가 줄인다
+	clock              func() time.Time                       // 실패 출력의 남긴 시각 · 보관 기간 판정 — 테스트가 바꾼다
+	outputDirectory    string                                 // 실패 출력을 남기는 폴더(failure_output.go)
+	outputMutex        sync.Mutex                             // 실패 출력의 저장 · 정리를 하나씩
+	nextSequence       int64                                  // 다음 실패 출력의 저장 번호(outputMutex 안에서만)
+	redact             func(raw string) shared.CapturedOutput // 실패 글의 가림 — 테스트가 바꾼다(가림의 실패)
 }
 
 // New — 이력 DB를 열고, 지난 실행에서 끝나지 못한 건을 실패로 닫는다. DB를 못 열면 뜨지 않는다(fail-closed).
@@ -82,7 +91,9 @@ func New(logger *shared.Logger) (*Master, error) {
 	master := &Master{secret: os.Getenv("DEPLOY_SECRET"), logger: logger, agents: agents,
 		store: store, inFlight: map[string]bool{}, unrecorded: map[string]Deployment{},
 		alerts:            shared.NewAlertSender("ci-cd", logger),
-		busyRetryInterval: 15 * time.Second, storeRetryInterval: 30 * time.Second, gitRelayTimeout: gitRelayTimeout}
+		busyRetryInterval: 15 * time.Second, storeRetryInterval: 30 * time.Second, gitRelayTimeout: gitRelayTimeout, clock: time.Now, redact: shared.CaptureOutput,
+		outputDirectory: failureOutputDirectory(path)}
+	master.prepareFailureOutputs()
 	closed, err := store.FailUnfinished(StageInterrupted, "master가 진행 중에 재시작됨", now())
 	if err != nil {
 		return nil, fmt.Errorf("미완료 건 정리 실패: %w", err)
@@ -102,6 +113,7 @@ func now() string { return time.Now().UTC().Format(time.RFC3339) }
 func (master *Master) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /deploy", master.handleDeploy)
 	mux.HandleFunc("GET /deploys/{requestID}", master.handleDeployment)
+	mux.HandleFunc("GET /deploys/{requestID}/output", master.handleFailureOutput)
 	mux.HandleFunc("GET /deploys", master.handleDeployments)
 	mux.HandleFunc("GET /status", master.handleStatus)
 	mux.HandleFunc("GET /deploys/git/commits", master.handleGitCommits)
@@ -195,16 +207,24 @@ func (master *Master) advance(deployment Deployment, agentURL string) {
 		delete(master.inFlight, deployment.Service)
 		master.mutex.Unlock()
 	}()
+	// fail — 모든 detail 의 원천(agent 단계 · agent_rejected · unexpected_response · agent_unreachable · store_failed)이 지나는 곳.
+	// 여기서 한 번 가려(agent 가 가렸어도 — 옛 agent 는 가리지 않는다) 이력 · 알림의 몸 · 로그의 끝을 그 가린 글에서 뗀다.
 	fail := func(stage, detail string) {
+		historyTail, alertTail, logTail := shared.DetailRedactionFailed, shared.DetailRedactionFailed, shared.DetailRedactionFailed
+		if masked, redacted, panicReason := shared.RedactSafely(master.redact, detail); redacted {
+			historyTail, alertTail, logTail = shared.CutTail(masked.Text, detailLimit), shared.CutTail(masked.Text, 800), shared.CutTail(masked.Text, 200)
+		} else {
+			master.logger.Log(deployment.RequestID, "redaction panicked: "+panicReason, "error")
+		}
 		deployment.State, deployment.FailedStage = StateFailed, stage
-		deployment.Detail, deployment.FinishedAt = lastPart(detail, detailLimit), now()
+		deployment.Detail, deployment.FinishedAt = historyTail, now()
 		master.logger.Log(deployment.RequestID, fmt.Sprintf("deploy failed %s sha=%s stage=%s %s",
-			deployment.Service, deployment.CommitSha, stage, lastPart(detail, 200)), "error")
+			deployment.Service, deployment.CommitSha, stage, logTail), "error")
 		master.recordFinished(deployment)
 		// 사람이 알아야 한다 — GitHub 메일에만 기대지 않는다. 보내기에 실패해도 배포 결과는 그대로다.
 		master.alerts.Send(deployment.RequestID, "deploy_failed", "warning", "deploy-failed:"+deployment.Service+":"+deployment.CommitSha,
 			fmt.Sprintf("배포 실패 %s — 단계 %s", deployment.Service, stage),
-			fmt.Sprintf("커밋 %s\n%s", deployment.CommitSha, lastPart(detail, 800)))
+			fmt.Sprintf("커밋 %s\n%s", deployment.CommitSha, alertTail))
 	}
 	enter := func(state string) bool {
 		deployment.State = state
@@ -220,9 +240,10 @@ func (master *Master) advance(deployment Deployment, agentURL string) {
 	}
 	busyRetries := busyRetryLimit // CI와 CD가 나눠 쓴다 — 단계마다 따로 주면 합계가 조회 상한을 넘는다
 	startedAt := time.Now()
-	stage, detail := master.callAgentWhenFree(agentURL+"/agent/ci", deployment, integrationCallTimeout, &busyRetries)
+	stage, detail, output := master.callAgentWhenFree(agentURL+"/agent/ci", deployment, integrationCallTimeout, &busyRetries)
 	deployment.IntegrationMs = time.Since(startedAt).Milliseconds()
 	if stage != "" {
+		master.keepFailureOutput(deployment, stage, detail, output) // 실패가 조회에 보이기 전에
 		fail(stage, detail)
 		return
 	}
@@ -230,9 +251,10 @@ func (master *Master) advance(deployment Deployment, agentURL string) {
 		return
 	}
 	startedAt = time.Now()
-	stage, detail = master.callAgentWhenFree(agentURL+"/agent/cd", deployment, deliveryCallTimeout, &busyRetries)
+	stage, detail, output = master.callAgentWhenFree(agentURL+"/agent/cd", deployment, deliveryCallTimeout, &busyRetries)
 	deployment.DeliveryMs = time.Since(startedAt).Milliseconds()
 	if stage != "" {
+		master.keepFailureOutput(deployment, stage, detail, output)
 		fail(stage, detail)
 		return
 	}
@@ -291,9 +313,10 @@ func (master *Master) actualAll(deployments []Deployment) []Deployment {
 
 // callAgentWhenFree — agent가 다른 작업 중(409 agent_busy)이면 간격을 두고 다시 부른다.
 // master가 재시작된 직후에는 agent가 앞선 작업을 아직 끝내지 못했을 수 있다.
-func (master *Master) callAgentWhenFree(url string, deployment Deployment, timeout time.Duration, busyRetries *int) (stage, detail string) {
+// output 은 agent 단계의 실패에서 agent 가 실은 전체 출력(없으면 nil — 옛 agent).
+func (master *Master) callAgentWhenFree(url string, deployment Deployment, timeout time.Duration, busyRetries *int) (stage, detail string, output *shared.CapturedOutput) {
 	for {
-		stage, detail = master.callAgent(url, deployment, timeout)
+		stage, detail, output = master.callAgent(url, deployment, timeout)
 		if stage != "agent_busy" || *busyRetries <= 0 {
 			break
 		}
@@ -301,40 +324,49 @@ func (master *Master) callAgentWhenFree(url string, deployment Deployment, timeo
 		time.Sleep(master.busyRetryInterval)
 	}
 	if stage != "" && stage != StageAgentUnreachable && !agentStages[stage] {
-		return StageAgentRejected, stage + ": " + detail
+		return StageAgentRejected, stage + ": " + detail, nil
 	}
-	return stage, detail
+	return stage, detail, output
 }
 
-// callAgent — 성공이면 stage가 빈 문자열. 실패면 agent가 알려 준 코드와 출력.
-func (master *Master) callAgent(url string, deployment Deployment, timeout time.Duration) (stage, detail string) {
+// callAgent — 성공이면 stage가 빈 문자열. 실패면 agent가 알려 준 코드와 출력(실패 봉투에 error.output 이 있으면 그것도).
+func (master *Master) callAgent(url string, deployment Deployment, timeout time.Duration) (stage, detail string, output *shared.CapturedOutput) {
 	payload, _ := json.Marshal(map[string]string{
 		"service": deployment.Service, "commit_sha": deployment.CommitSha, "request_id": deployment.RequestID,
 	})
 	agentRequest, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
 	agentRequest.Header.Set("Content-Type", "application/json")
 	agentRequest.Header.Set(shared.SecretHeader, master.secret)
+	agentRequest.Header.Set(shared.FailureOutputHeader, shared.FailureOutputVersion) // 단계가 실패하면 전체 출력을 실어 달라
 	response, err := (&http.Client{Timeout: timeout}).Do(agentRequest)
 	if err != nil {
-		return StageAgentUnreachable, err.Error()
+		return StageAgentUnreachable, err.Error(), nil
 	}
 	defer response.Body.Close()
-	responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 16384))
+	responseBody, _ := io.ReadAll(io.LimitReader(response.Body, agentResponseLimit))
 	var envelope struct {
 		Success bool `json:"success"`
 		Error   struct {
-			Code   string `json:"code"`
-			Detail string `json:"detail"`
+			Code   string          `json:"code"`
+			Detail string          `json:"detail"`
+			Output json.RawMessage `json:"output"`
 		} `json:"error"`
 	}
 	parseErr := json.Unmarshal(responseBody, &envelope)
 	if response.StatusCode == http.StatusOK && parseErr == nil && envelope.Success {
-		return "", ""
+		return "", "", nil
 	}
 	if parseErr != nil || envelope.Error.Code == "" { // agent의 봉투가 아니다 — 200이어도 성공으로 치지 않는다
-		return "unexpected_response", fmt.Sprintf("status %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
+		shown := responseBody[:min(len(responseBody), unexpectedResponseDetailLimit)]
+		return "unexpected_response", fmt.Sprintf("status %d: %s", response.StatusCode, strings.TrimSpace(string(shown))), nil
 	}
-	return envelope.Error.Code, envelope.Error.Detail
+	if len(envelope.Error.Output) > 0 { // 꼴이 다르면 없는 것으로 친다 — 단계 · detail 은 그대로 쓴다
+		var carried shared.CapturedOutput
+		if json.Unmarshal(envelope.Error.Output, &carried) == nil {
+			output = &carried
+		}
+	}
+	return envelope.Error.Code, envelope.Error.Detail, output
 }
 
 func (master *Master) handleDeployment(writer http.ResponseWriter, request *http.Request) {
@@ -396,12 +428,4 @@ func keys(input map[string]string) []string {
 		result = append(result, key)
 	}
 	return result
-}
-
-// lastPart — 출력의 끝부분. 빌드·테스트 오류는 끝에 있다.
-func lastPart(input string, limit int) string {
-	if len(input) <= limit {
-		return input
-	}
-	return input[len(input)-limit:]
 }
