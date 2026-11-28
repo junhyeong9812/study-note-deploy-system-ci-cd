@@ -39,6 +39,7 @@ func (sender *AlertSender) Send(requestID, kind, severity, key, title, detail st
 		}
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("X-Alert-Secret", sender.secret)
+		request.Header.Set(RequestIDHeader, NewTrackingID()) // 들어온 요청 없이 시작되는 호출 — 보낼 때마다 새 추적 ID(로그의 ID 는 부른 쪽의 것 그대로)
 		response, err := sender.client.Do(request)
 		if err != nil {
 			sender.logger.Log(requestID, "alert not sent: "+err.Error(), "warning")

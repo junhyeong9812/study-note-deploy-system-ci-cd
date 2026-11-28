@@ -6,6 +6,7 @@ package master
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -257,6 +258,13 @@ func (master *Master) cleanFailureOutputs(requestID string) {
 
 // handleFailureOutput — GET /deploys/{requestID}/output. 상태 · 코드의 표는 failure_output_test.go 머리.
 func (master *Master) handleFailureOutput(writer http.ResponseWriter, request *http.Request) {
+	recorder, job := shared.RecordStatus(writer), shared.JobForLog(request.PathValue("requestID"))
+	writer = recorder
+	defer func() { // 실패했을 때만(상태 조회와 같다)
+		if !recorder.Succeeded() {
+			master.logger.Log(shared.TrackingID(request.Context()), fmt.Sprintf("deploy output job=%s -> %s", job, recorder.Outcome()), "info")
+		}
+	}()
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.Header().Set("X-Content-Type-Options", "nosniff")
 	if !shared.SecretMatches(request, master.secret) {

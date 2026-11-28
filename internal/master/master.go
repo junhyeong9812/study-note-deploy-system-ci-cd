@@ -121,6 +121,12 @@ func (master *Master) Register(mux *http.ServeMux) {
 }
 
 func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Request) {
+	// 추적의 ID 와 일의 ID 를 잇는 줄 하나(추적의 ID 로) — 일의 ID 를 정하기 전에 끝나면 job=invalid. 그 밖의 줄은 지금처럼 일의 ID 로 남는다
+	recorder, job := shared.RecordStatus(writer), "invalid"
+	writer = recorder
+	defer func() {
+		master.logger.Log(shared.TrackingID(request.Context()), fmt.Sprintf("deploy accept job=%s -> %s", job, recorder.Outcome()), "info")
+	}()
 	if !shared.SecretMatches(request, master.secret) {
 		shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")
 		return
@@ -131,11 +137,16 @@ func (master *Master) handleDeploy(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	var deploy DeployRequest
-	if err := json.Unmarshal(body, &deploy); err != nil || deploy.Service == "" || deploy.CommitSha == "" {
+	parseErr := json.Unmarshal(body, &deploy)
+	var requestID string
+	if parseErr == nil {
+		requestID = shared.AcceptOrIssue(deploy.RequestID)
+		job = requestID
+	}
+	if parseErr != nil || deploy.Service == "" || deploy.CommitSha == "" {
 		shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_request", "need service·commit_sha")
 		return
 	}
-	requestID := shared.AcceptOrIssue(deploy.RequestID)
 	if !shared.ValidCommitSha(deploy.CommitSha) { // 접수 전에 거절 — 로그 주입·비정상 202 차단
 		shared.WriteFail(writer, http.StatusUnprocessableEntity, "invalid_sha", "")
 		return
@@ -338,11 +349,16 @@ func (master *Master) callAgent(url string, deployment Deployment, timeout time.
 	agentRequest.Header.Set("Content-Type", "application/json")
 	agentRequest.Header.Set(shared.SecretHeader, master.secret)
 	agentRequest.Header.Set(shared.FailureOutputHeader, shared.FailureOutputVersion) // 단계가 실패하면 전체 출력을 실어 달라
+	// 들어온 요청 없이 시작되는 호출 — 호출마다 새 추적 ID(409 로 다시 부르는 것도 새 값). 일의 ID 는 본문 request_id 그대로
+	trackingID, step := shared.NewTrackingID(), url[strings.LastIndex(url, "/")+1:]
+	agentRequest.Header.Set(shared.RequestIDHeader, trackingID)
 	response, err := (&http.Client{Timeout: timeout}).Do(agentRequest)
 	if err != nil {
+		master.logger.Log(trackingID, fmt.Sprintf("deploy %s call job=%s -> unreachable", step, deployment.RequestID), "info")
 		return StageAgentUnreachable, err.Error(), nil
 	}
 	defer response.Body.Close()
+	master.logger.Log(trackingID, fmt.Sprintf("deploy %s call job=%s -> %d", step, deployment.RequestID, response.StatusCode), "info")
 	responseBody, _ := io.ReadAll(io.LimitReader(response.Body, agentResponseLimit))
 	var envelope struct {
 		Success bool `json:"success"`
@@ -370,6 +386,13 @@ func (master *Master) callAgent(url string, deployment Deployment, timeout time.
 }
 
 func (master *Master) handleDeployment(writer http.ResponseWriter, request *http.Request) {
+	recorder, job := shared.RecordStatus(writer), shared.JobForLog(request.PathValue("requestID"))
+	writer = recorder
+	defer func() { // 실패했을 때만 — 워크플로가 10초마다 조회하므로 성공한 조회마다 남기면 배포 하나에 수십 줄이 된다
+		if !recorder.Succeeded() {
+			master.logger.Log(shared.TrackingID(request.Context()), fmt.Sprintf("deploy status job=%s -> %s", job, recorder.Outcome()), "info")
+		}
+	}()
 	if !shared.SecretMatches(request, master.secret) {
 		shared.WriteFail(writer, http.StatusUnauthorized, "unauthorized", "")
 		return

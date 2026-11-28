@@ -178,7 +178,7 @@ func (agent *Agent) serveGitRead(writer http.ResponseWriter, request *http.Reque
 		return
 	}
 
-	requestID := shared.AcceptOrIssue(request.Header.Get("X-Request-Id"))
+	requestID := shared.TrackingID(request.Context()) // 판정한 추적 ID(사설 대역 · 루프백에서 온 꼴 맞는 값만 — shared.TrackRequests)
 	ctx, cancel := context.WithTimeout(request.Context(), agent.gitTimeout)
 	defer cancel()
 	startedAt := time.Now()

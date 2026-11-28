@@ -232,13 +232,23 @@ func staleImageTags(listing, deployedSha string) []string {
 	return stale
 }
 
+// getWithFreshTrackingID — 들어온 요청 없이 시작되는 호출(배포 중의 헬스 · 자리 확인): 호출마다 새 추적 ID 를 싣는다.
+func getWithFreshTrackingID(client *http.Client, target string) (*http.Response, error) {
+	request, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set(shared.RequestIDHeader, shared.NewTrackingID())
+	return client.Do(request)
+}
+
 // waitHealthy — 배포 후 서비스 헬스가 200이 될 때까지 폴링 (기동 시간 감안)
 func waitHealthy(healthURL string, budget time.Duration) error {
 	deadline := time.Now().Add(budget)
 	client := &http.Client{Timeout: 3 * time.Second}
 	var lastError error
 	for time.Now().Before(deadline) {
-		response, err := client.Get(healthURL)
+		response, err := getWithFreshTrackingID(client, healthURL)
 		if err == nil {
 			response.Body.Close()
 			if response.StatusCode == http.StatusOK {

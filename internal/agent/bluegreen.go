@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/junhyeong9812/study-note-deploy-system-ci-cd/internal/shared"
 )
 
 // blue/green 전환 — 새 버전을 비어 있는 자리에 띄워 헬스를 확인한 뒤 nginx 대상을 바꾼다.
@@ -91,7 +93,7 @@ func writeFileAtomically(path, content string) error {
 // probeSlot — nginx가 붙인 자리 표식과, 응답이 200인지.
 // 200이 아니어도 표식은 돌려준다: 앱이 죽어 nginx가 502를 내는 상황에서도 "nginx가 어느 자리로 보내는지"는 알 수 있다.
 func probeSlot(healthURL string) (string, error) {
-	response, err := (&http.Client{Timeout: 3 * time.Second}).Get(healthURL)
+	response, err := getWithFreshTrackingID(&http.Client{Timeout: 3 * time.Second}, healthURL)
 	if err != nil {
 		return "", err
 	}
@@ -122,7 +124,13 @@ func (agent *Agent) servingSlot(publicURL string) (string, error) {
 }
 
 func notifyDrain(drainURL string) error {
-	response, err := (&http.Client{Timeout: 5 * time.Second}).Post(drainURL, "application/json", strings.NewReader("{}"))
+	request, err := http.NewRequest(http.MethodPost, drainURL, strings.NewReader("{}"))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(shared.RequestIDHeader, shared.NewTrackingID()) // 들어온 요청 없이 시작되는 호출 — 호출마다 새 추적 ID
+	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
 	if err != nil {
 		return err
 	}
