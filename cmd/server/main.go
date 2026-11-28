@@ -17,9 +17,6 @@ func main() {
 	mode := os.Getenv("MODE")
 	logger := shared.NewLogger()
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(writer http.ResponseWriter, request *http.Request) {
-		shared.WriteOK(writer, map[string]string{"mode": mode})
-	})
 
 	var defaultPort string
 	switch mode {
@@ -30,6 +27,9 @@ func main() {
 			os.Exit(1)
 		}
 		deployMaster.Register(mux)
+		mux.HandleFunc("GET /health", func(writer http.ResponseWriter, request *http.Request) {
+			shared.WriteOK(writer, map[string]string{"mode": mode})
+		})
 		defaultPort = "15000"
 	case "agent":
 		deployAgent := agent.New(logger)
@@ -38,6 +38,9 @@ func main() {
 		go deployAgent.ReconcileSlotsUntil(0, 30*time.Second) // 실제 자리를 확인할 때까지 — 포기하면 두 벌이 남는다
 		// 자원 지표 — 30초마다 Redis 스트림으로(LOG_REDIS_URL 이 비면 시작하지 않는다). 배포 잠금과 무관하게 따로 돈다
 		deployAgent.StartResourceMetrics(context.Background())
+		// 통신 수치 — 30초마다 nginx 컨테이너의 접속 기록을 Redis 스트림 traffic 으로(설정이 없거나 틀리면 시작하지 않고 헬스가 까닭을 낸다)
+		traffic := deployAgent.StartTraffic(context.Background())
+		mux.HandleFunc("GET /health", agent.AgentHealthHandler(mode, traffic))
 		defaultPort = "15001"
 	default:
 		fmt.Fprintln(os.Stderr, "MODE must be master or agent") // fail-closed: 모드 없이 뜨지 않는다
